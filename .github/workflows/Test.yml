@@ -1,14 +1,13 @@
 # .github/workflows/build.yml
-# R.C. Pro-Am II (mapper 7 / AxROM) recomp: boot test.
+# R.C. Pro-Am II (mapper 7 / AxROM) recomp: boot test, launcher skipped.
 #
-# Goal of this run: build a runner around the generated code using an existing
-# public NESRecomp game repo (YoshiNESRecomp, MMC1) as a TEMPLATE, then run the
-# result headless for 45 seconds and print what happened.
-#
-# EXPECT FAILURES. The template is written for another game, so each run will
-# probably stop at the next mismatch. The log is the point: paste the failing
-# step's output back and we fix that one thing. The template files are printed
-# on purpose so the next version can be written against the real layout.
+# State so far: the template (YoshiNESRecomp) builds against this ROM and the
+# game binary launches, but it sat in the pre-boot launcher menu. This run
+# tries two ways past that:
+#   A) windowed mode under a virtual display with SkipLauncher = 1 in config.ini
+#   B) the binary's own --headless / --frames / --hash-out flags
+# The flag syntax in B is guessed from strings inside the binary, so B may print
+# a usage error. Either way the log tells us the right syntax.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -56,36 +55,15 @@ jobs:
           cd game
           chmod +x setup.sh
           ./setup.sh
-          echo "---- template layout ----"
-          ls -la
-          echo "---- setup.sh (first 80 lines) ----"
-          head -n 80 setup.sh
-          echo "---- CMakeLists.txt (first 150 lines) ----"
-          head -n 150 CMakeLists.txt
-          echo "---- framework commit ----"
-          git -C nesrecomp log -1 --format='%H (%cd)' || true
+          git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
 
-      - name: Replace the template's game config with an empty one
+      - name: Replace the template's Yoshi-specific config
         run: |
           cd game
           printf '# empty config: first boot test for an AxROM game\n' > game.toml
-          # The template ships Yoshi's code-seed addresses; they are wrong for
-          # this ROM, so leave the file present but empty.
+          # Yoshi's code-seed addresses are wrong for this ROM: keep the file, empty it.
           : > cyc_seeds.txt
           rm -rf generated
-
-      - name: Build the recompiler
-        run: |
-          cd game
-          cmake -S nesrecomp/recompiler -B nesrecomp/build/recompiler \
-            -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build nesrecomp/build/recompiler
-
-      - name: Generate C from the ROM
-        run: |
-          cd game
-          nesrecomp/build/recompiler/NESRecomp "$ROM_PATH" --game game.toml
-          ls generated | head -n 40
 
       - name: Build the game runner
         run: |
@@ -101,57 +79,40 @@ jobs:
           STATUS=$?
           set -e
           echo "build exit status: $STATUS"
-          echo "---- error lines ----"
           grep -n -i -E 'error|fatal|undefined reference|no such file' build_full.log | head -n 40 || true
-          echo "---- last 40 lines of build output ----"
-          tail -n 40 build_full.log
-          echo "---- nested build logs ----"
-          for f in $(find build -mindepth 2 -maxdepth 3 \( -name '*.log' -o -name '*.err' \) ! -path '*CMakeFiles*'); do
-            echo "== $f"
-            tail -n 40 "$f"
-          done
+          tail -n 20 build_full.log
           exit $STATUS
 
-      - name: Run headless for 45 seconds
+      - name: Boot test with the launcher skipped
         continue-on-error: true
         run: |
-          cd game
-          echo "---- build/ top level ----"
-          ls -la build
-          echo "---- all executables under build/ ----"
-          find build -type f -perm -u+x ! -path '*CMakeFiles*' \
-            ! -name '*.so*' ! -name '*.a' | sort
-          # The template's CMake builds a host recompiler in build/nesrecomp-host;
-          # that is a build tool, not the game, so skip it.
-          EXE=$(find build -type f -perm -u+x ! -path '*CMakeFiles*' \
-                ! -path '*nesrecomp-host*' ! -name '*.so*' ! -name '*.a' | head -n 1)
-          if [ -z "$EXE" ]; then
-            echo "No game executable found: the game target may not have built."
-            exit 1
-          fi
-          echo "game executable: $EXE"
-          EXE=$(realpath "$EXE")
-          cd "$(dirname "$EXE")"
-          timeout 45 xvfb-run -a env SDL_AUDIODRIVER=dummy "$EXE" "$ROM_PATH" \
-            > run.log 2>&1 || echo "exited with status $? (124 = hit the 45 s timeout, which is fine)"
-          echo "---- last 60 lines of run.log ----"
-          tail -n 60 run.log
-          echo "---- files next to the executable ----"
+          cd game/build
+          EXE=$(realpath YoshiRecomp)
+          echo "---- every command-line flag found inside the binary ----"
+          strings -a "$EXE" | grep -E '^--[a-z][a-z0-9-]+' | sort -u | head -n 200 || true
+
+          echo "==== Attempt A: windowed under a virtual display, launcher skipped ===="
+          printf '[Launcher]\nSkipLauncher = 1\n' > config.ini
+          timeout 30 xvfb-run -a env SDL_AUDIODRIVER=dummy "$EXE" "$ROM_PATH" \
+            > runA.log 2>&1 || echo "A exited with status $? (124 = ran until the 30 s timeout)"
+          echo "---- A: last 40 lines ----"
+          tail -n 40 runA.log
+
+          echo "==== Attempt B: built-in headless flags (syntax guessed) ===="
+          timeout 60 env SDL_AUDIODRIVER=dummy "$EXE" --headless --frames 600 \
+            --hash-out frames.hash "$ROM_PATH" \
+            > runB.log 2>&1 || echo "B exited with status $?"
+          echo "---- B: last 40 lines ----"
+          tail -n 40 runB.log
+
+          echo "---- new files next to the executable ----"
           ls -la
+          echo "---- frames.hash (first 10 lines) ----"
+          head -n 10 frames.hash 2>/dev/null || echo "none"
           echo "---- dispatch_misses.log (first 40 lines) ----"
           head -n 40 dispatch_misses.log 2>/dev/null || echo "none"
           echo "---- fallback_telemetry.jsonl (last 5 lines) ----"
           tail -n 5 fallback_telemetry.jsonl 2>/dev/null || echo "none"
-          echo "---- config.ini ----"
-          cat config.ini 2>/dev/null || echo "none"
-          echo "---- --help output ----"
-          timeout 10 xvfb-run -a env SDL_AUDIODRIVER=dummy "$EXE" --help 2>&1 | head -n 60 || true
-          echo "---- command-line flags found inside the binary ----"
-          strings -a "$EXE" | grep -E '^--[a-z][a-z0-9-]+' | sort -u | head -n 60 || true
-          echo "---- launcher/option lines in the CMake files ----"
-          cd ..
-          grep -n -i -E 'option\(|launcher|headless|no[-_]?ui' CMakeLists.txt \
-            nesrecomp/runner/cyc/*.cmake 2>/dev/null | head -n 60 || true
 
       - name: Wipe ROM and generated code
         if: always()
