@@ -1,0 +1,145 @@
+# .github/workflows/build.yml
+# Draft workflow for an R.C. Pro-Am recomp built on mstan/nesrecomp.
+#
+# ASSUMED repo layout (modeled on the Dr. Mario / Yoshi / Super Dodge Ball repos):
+#   nesrecomp/   pinned framework submodule (recompiler + runner)
+#   game.toml    recompiler config (MMC1 banking, extra entry points)
+#   extras.c     game-specific hooks
+#   setup.sh     initializes submodules
+#
+# Commands marked TODO are guesses from other repos' READMEs. Verify them.
+#
+# REQUIRED REPOSITORY VARIABLES (Settings > Secrets and variables > Actions > Variables):
+#   ROM_URL   Google Drive direct link to YOUR OWN legal dump, in this form:
+#             https://drive.google.com/uc?export=download&id=YOUR_FILE_ID
+#             (share the file as "Anyone with the link"; keep this repo private)
+#   ROM_SHA1  expected SHA-1 of that dump
+# Variables are plain text and visible to anyone with repo access, so never
+# make this repo public while the link is set.
+
+name: rcproam-recomp
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  recompile-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          # TODO: match this list to what setup.sh / CMake actually require
+          sudo apt-get install -y build-essential cmake ninja-build python3
+
+      - name: Fetch ROM from Google Drive (kept on the runner only)
+        env:
+          ROM_URL: ${{ vars.ROM_URL }}
+          ROM_SHA1: ${{ vars.ROM_SHA1 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rom"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/rom/game.nes" "$ROM_URL"
+          # Drive can return an HTML error page instead of the file; the NES
+          # header check and the hash both catch that.
+          head -c 4 "$RUNNER_TEMP/rom/game.nes" | grep -q '^NES' \
+            || { echo "Download is not an iNES file (bad link or Drive error)"; exit 1; }
+          F="$RUNNER_TEMP/rom/game.nes"
+          # Print basic facts about the dump so you can pick the right version.
+          PRG=$(od -An -tu1 -j4 -N1 "$F" | tr -d ' ')
+          CHR=$(od -An -tu1 -j5 -N1 "$F" | tr -d ' ')
+          F6=$(od -An -tu1 -j6 -N1 "$F" | tr -d ' ')
+          F7=$(od -An -tu1 -j7 -N1 "$F" | tr -d ' ')
+          echo "SHA-1:  $(sha1sum "$F" | cut -d' ' -f1)"
+          echo "iNES:   PRG=$((PRG * 16)) KB, CHR=$((CHR * 8)) KB, mapper=$(( (F7 & 240) | (F6 >> 4) ))"
+          # Inspection mode: leave the ROM_SHA1 variable unset on the first run,
+          # read the values above in the log, then set ROM_SHA1 and rerun.
+          if [ -z "${ROM_SHA1:-}" ]; then
+            echo "ROM_SHA1 is not set: stopping after inspection."
+            exit 1
+          fi
+          echo "$ROM_SHA1  $F" | sha1sum -c -
+          echo "ROM_PATH=$F" >> "$GITHUB_ENV"
+
+      - name: Framework setup
+        run: |
+          chmod +x setup.sh
+          ./setup.sh
+
+      - name: Build the recompiler
+        run: |
+          cmake -S nesrecomp/recompiler -B nesrecomp/build/recompiler \
+            -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build nesrecomp/build/recompiler
+
+      - name: Generate C from the ROM
+        run: |
+          # TODO: binary name/path may differ on Linux
+          nesrecomp/build/recompiler/NESRecomp "$ROM_PATH" --game game.toml
+
+      - name: Build the native runner
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNESRECOMP_ROM="$ROM_PATH"
+          cmake --build build
+
+      - name: Headless smoke test
+        run: |
+          # TODO: run N frames with SDL_VIDEODRIVER=dummy / SDL_AUDIODRIVER=dummy
+          # and compare frame hashes against the Nestopia oracle
+          # (see nesrecomp/tools/cyc/cyc_verify.py in the Yoshi repo's README).
+          echo "not implemented yet"
+
+      - name: Wipe ROM and generated code
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rom" generated
+
+      # Deliberately no upload-artifact step: generated C and binaries are
+      # derived from the ROM. Add one later with retention-days: 1 if needed.
+
+  ios-build:
+    # Disabled until an iOS target exists. The framework's game repos build
+    # for desktop; you must write an SDL3/Metal Xcode wrapper first.
+    if: false
+    needs: recompile-linux
+    runs-on: macos-14
+    timeout-minutes: 45   # macOS minutes are billed at a multiple; check your plan
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # TODO: re-fetch ROM (same step as above), regenerate C, then:
+      # - name: Build unsigned iOS app
+      #   run: |
+      #     xcodebuild -project ios/RCProAm.xcodeproj -scheme RCProAm \
+      #       -sdk iphoneos -configuration Release \
+      #       CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+      #       -derivedDataPath build-ios
+      # - name: Package unsigned IPA
+      #   run: |
+      #     mkdir Payload
+      #     cp -R build-ios/Build/Products/Release-iphoneos/RCProAm.app Payload/
+      #     zip -r RCProAm-unsigned.zip Payload && mv RCProAm-unsigned.zip RCProAm-unsigned.ipa
+      # - uses: actions/upload-artifact@v4
+      #   with:
+      #     name: ipa
+      #     path: RCProAm-unsigned.ipa
+      #     retention-days: 1
+      #
+      # The IPA contains code recompiled from the ROM: keep this repo private.
+      # Sign it yourself when sideloading (e.g. with your Apple ID).
