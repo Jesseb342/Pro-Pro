@@ -9,13 +9,13 @@
 #
 # Commands marked TODO are guesses from other repos' READMEs. Verify them.
 #
-# REQUIRED REPOSITORY VARIABLES (Settings > Secrets and variables > Actions > Variables):
-#   ROM_URL   Google Drive direct link to YOUR OWN legal dump, in this form:
-#             https://drive.google.com/uc?export=download&id=YOUR_FILE_ID
-#             (share the file as "Anyone with the link"; keep this repo private)
-#   ROM_SHA1  expected SHA-1 of that dump
-# Variables are plain text and visible to anyone with repo access, so never
-# make this repo public while the link is set.
+# ROM_URL is hardcoded in the "Fetch ROM" step below (Google Drive direct link
+# to YOUR OWN legal dump; the file must be shared as "Anyone with the link").
+# Keep this repo private: anyone who can read this file can read the link.
+#
+# OPTIONAL REPOSITORY VARIABLE (Settings > Secrets and variables > Actions > Variables):
+#   ROM_SHA1  expected SHA-1 of the dump. Leave unset on the first run to
+#             print the hash and header info, then set it.
 
 name: rcproam-recomp
 
@@ -48,7 +48,7 @@ jobs:
 
       - name: Fetch ROM from Google Drive (kept on the runner only)
         env:
-          ROM_URL: ${{ vars.ROM_URL }}
+          ROM_URL: "https://drive.google.com/uc?export=download&id=13qlBFeeqRVl-sMBtlnH5PRf9poEicja5"
           ROM_SHA1: ${{ vars.ROM_SHA1 }}
         run: |
           set -euo pipefail
