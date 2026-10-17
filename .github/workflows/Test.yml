@@ -1,17 +1,18 @@
 # .github/workflows/build.yml
 # R.C. Pro-Am II (mapper 7 / AxROM) recomp on the NESRecomp cycle backend.
 #
-# PROVEN so far (previous run): build the template against this ROM, run the
-# game headless, turn the interpreter miss log into cyc_seeds.txt, rebuild, and
-# the rerun executed 100% natively with all 3600 frame hashes IDENTICAL to the
-# interpreter run. Coverage is only what the game did on its own in 3600
-# frames (about 3,000 instructions, apparently an idle title loop).
+# PROVEN so far: build the template against this ROM, run the game headless,
+# turn the interpreter miss log into cyc_seeds.txt, rebuild, and the rerun
+# executes 100% natively with all 3600 frame hashes IDENTICAL to the
+# interpreter run. Coverage is only what the game did by itself in 3600 frames.
 #
-# This run, by default, only READS the framework source to learn how scripted
-# button input (--input / --virtual-pad) and frame dumps (--shot-every /
-# --present-out) work, so we can reach the rest of the game. No ROM is
-# downloaded for that. Tick "run_seed_loop" when starting the workflow to
-# repeat the full build + seed loop instead.
+# Options when you tap "Run workflow":
+#   run_seed_loop    fetch the ROM, build, and repeat the seed loop
+#   save_screenshots fetch the ROM, build, run headless, and upload PNG frames
+#                    as a PRIVATE artifact kept 1 day (these are game screens:
+#                    keep the repo private and delete the artifact afterwards)
+# With both unticked it only reads framework source to learn the --input file
+# format, which is what we still need before scripting button presses.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -22,7 +23,11 @@ on:
   workflow_dispatch:
     inputs:
       run_seed_loop:
-        description: "Also fetch the ROM, build, and run the seed loop"
+        description: "Fetch the ROM, build, and run the seed loop"
+        type: boolean
+        default: false
+      save_screenshots:
+        description: "Fetch the ROM, build, and upload PNG frames (private, 1 day)"
         type: boolean
         default: false
 
@@ -52,23 +57,24 @@ jobs:
           ./setup.sh
           git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
 
-      - name: Read the framework source for input and frame-dump syntax
+      - name: Read the framework source for the --input file format
         continue-on-error: true
         run: |
           cd game
-          echo "==== docs mentioning the flags ===="
-          grep -rn -i -B1 -A6 -E -e '--input|--virtual-pad|--present-out|--shot-every' \
-            nesrecomp --include='*.md' 2>/dev/null | head -n 90 || true
-          echo "==== where --input's file is read ===="
-          grep -n 'input_file' nesrecomp/runner/cyc/cyc_host.c | head -n 20 || true
-          grep -rn -B2 -A30 -e 'fopen(input_file' nesrecomp/runner/cyc | head -n 90 || true
-          echo "==== how --shot-every is used ===="
-          grep -n -B1 -A10 -e 'shot_every' nesrecomp/runner/cyc/cyc_host.c | sed -n '1,70p' || true
-          echo "==== how --present-out is used ===="
-          grep -n -B1 -A10 -e 'present_out' nesrecomp/runner/cyc/cyc_host.c | sed -n '1,70p' || true
+          echo "==== how the input file is parsed (load_input) ===="
+          grep -n 'load_input' nesrecomp/runner/cyc/cyc_host.c | head -n 10 || true
+          grep -n -A70 -e 'static bool load_input' nesrecomp/runner/cyc/cyc_host.c | head -n 110 || true
+          echo "==== README text about input schedules ===="
+          grep -n -i -B2 -A20 -E 'input schedule|schedule file|route\.txt' \
+            nesrecomp/runner/cyc/README.md | head -n 90 || true
+          echo "==== example input files in the repos ===="
+          FILES=$(find . -type f \( -iname '*route*.txt' -o -iname '*into_level*' \
+            -o -iname '*input*.txt' \) -not -path './nesrecomp/runner/external/*' | head -n 3)
+          echo "${FILES:-none found}"
+          for f in $FILES; do echo "== $f"; head -n 25 "$f"; done
 
       - name: Fetch ROM from Google Drive (kept on the runner only)
-        if: ${{ inputs.run_seed_loop }}
+        if: ${{ inputs.run_seed_loop || inputs.save_screenshots }}
         env:
           ROM_URL: "https://drive.google.com/uc?export=download&id=13qlBFeeqRVl-sMBtlnH5PRf9poEicja5"
           ROM_SHA1: "d536d1a6d87fa2c9d32f58f76c9545cc506fea8f"
@@ -83,7 +89,7 @@ jobs:
           echo "ROM_PATH=$F" >> "$GITHUB_ENV"
 
       - name: Replace the template's Yoshi-specific config
-        if: ${{ inputs.run_seed_loop }}
+        if: ${{ inputs.run_seed_loop || inputs.save_screenshots }}
         run: |
           cd game
           printf '# empty config: first boot test for an AxROM game\n' > game.toml
@@ -92,7 +98,7 @@ jobs:
           rm -rf generated
 
       - name: Build the game runner
-        if: ${{ inputs.run_seed_loop }}
+        if: ${{ inputs.run_seed_loop || inputs.save_screenshots }}
         run: |
           cd game
           # The framework bundles Windows SDL2 headers (they need windows.h),
@@ -150,10 +156,33 @@ jobs:
             diff build/frames_base.hash build/frames_seeded.hash | head -n 6
           fi
 
+      - name: Capture screenshots (headless)
+        if: ${{ inputs.save_screenshots }}
+        continue-on-error: true
+        run: |
+          cd game/build
+          mkdir -p shots
+          export SDL_AUDIODRIVER=dummy
+          # --screenshot needs a file name; --shot-every N writes a numbered
+          # 256x240 PNG every N frames. 3600 frames = about 1 minute of game time.
+          timeout 150 ./YoshiRecomp "$ROM_PATH" --headless --frames 3600 \
+            --screenshot shots/frame.png --shot-every 600 > shots.log 2>&1 \
+            || echo "exited with status $?"
+          tail -n 5 shots.log
+          ls -la shots
+
+      - name: Upload screenshots (private artifact, kept 1 day)
+        if: ${{ inputs.save_screenshots }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: game/build/shots/*.png
+          retention-days: 1
+          if-no-files-found: warn
+
       - name: Wipe ROM and generated code
         if: always()
         run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
 
-      # No upload-artifact step: generated C, binaries and screenshots are
-      # derived from the ROM. Next: scripted button input, then commit the
-      # growing seed file (addresses only) back to this repo so it persists.
+      # Next: a scripted --input file to get past the title screen, then commit
+      # the growing seed file (addresses only) back to this repo so it persists.
