@@ -89,7 +89,21 @@ jobs:
           cd game
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DNESRECOMP_ROM="$ROM_PATH"
-          cmake --build build 2>&1 | tail -n 120
+          set +e
+          cmake --build build > build_full.log 2>&1
+          STATUS=$?
+          set -e
+          echo "build exit status: $STATUS"
+          echo "---- error lines ----"
+          grep -n -i -E 'error|fatal|undefined reference|no such file' build_full.log | head -n 40 || true
+          echo "---- last 40 lines of build output ----"
+          tail -n 40 build_full.log
+          echo "---- nested build logs ----"
+          for f in $(find build -mindepth 2 -maxdepth 3 \( -name '*.log' -o -name '*.err' \) ! -path '*CMakeFiles*'); do
+            echo "== $f"
+            tail -n 40 "$f"
+          done
+          exit $STATUS
 
       - name: Run headless for 45 seconds
         continue-on-error: true
