@@ -95,9 +95,20 @@ jobs:
         continue-on-error: true
         run: |
           cd game
-          EXE=$(find build -maxdepth 3 -type f -perm -u+x \
-                ! -name '*.so*' ! -name '*.a' ! -path '*CMakeFiles*' | head -n 1)
-          echo "game executable: ${EXE:-NOT FOUND}"
+          echo "---- build/ top level ----"
+          ls -la build
+          echo "---- all executables under build/ ----"
+          find build -type f -perm -u+x ! -path '*CMakeFiles*' \
+            ! -name '*.so*' ! -name '*.a' | sort
+          # The template's CMake builds a host recompiler in build/nesrecomp-host;
+          # that is a build tool, not the game, so skip it.
+          EXE=$(find build -type f -perm -u+x ! -path '*CMakeFiles*' \
+                ! -path '*nesrecomp-host*' ! -name '*.so*' ! -name '*.a' | head -n 1)
+          if [ -z "$EXE" ]; then
+            echo "No game executable found: the game target may not have built."
+            exit 1
+          fi
+          echo "game executable: $EXE"
           EXE=$(realpath "$EXE")
           cd "$(dirname "$EXE")"
           timeout 45 xvfb-run -a env SDL_AUDIODRIVER=dummy "$EXE" "$ROM_PATH" \
