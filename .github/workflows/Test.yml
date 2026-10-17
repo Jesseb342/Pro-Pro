@@ -1,20 +1,17 @@
 # .github/workflows/build.yml
-# R.C. Pro-Am II (mapper 7 / AxROM) recomp: seed loop.
+# R.C. Pro-Am II (mapper 7 / AxROM) recomp on the NESRecomp cycle backend.
 #
-# Known so far: the template (YoshiNESRecomp) builds against this ROM and its
-# headless mode runs the game, but 99.8% of execution goes through the
-# interpreter fallback because no code seeds exist yet. In a 3600-frame run
-# only ~1,700 ROM addresses were touched: the game appears to idle at its
-# title screen because nothing presses a button.
+# PROVEN so far (previous run): build the template against this ROM, run the
+# game headless, turn the interpreter miss log into cyc_seeds.txt, rebuild, and
+# the rerun executed 100% natively with all 3600 frame hashes IDENTICAL to the
+# interpreter run. Coverage is only what the game did on its own in 3600
+# frames (about 3,000 instructions, apparently an idle title loop).
 #
-# This run:
-#   1) learns the syntax of --input / --virtual-pad / --present-out from the
-#      framework SOURCE (the binary only gave flag names)
-#   2) baseline run -> miss log -> cyc_seeds.txt -> rebuild -> rerun, then
-#      compares per-frame hashes. IDENTICAL means the seeded (more compiled)
-#      build behaves exactly like the interpreter run.
-# The miss-log -> seed-file conversion is a GUESS (strip counts); the printed
-# format of Yoshi's original seed file tells us if it is right.
+# This run, by default, only READS the framework source to learn how scripted
+# button input (--input / --virtual-pad) and frame dumps (--shot-every /
+# --present-out) work, so we can reach the rest of the game. No ROM is
+# downloaded for that. Tick "run_seed_loop" when starting the workflow to
+# repeat the full build + seed loop instead.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -23,6 +20,11 @@ name: rcproam2-recomp
 
 on:
   workflow_dispatch:
+    inputs:
+      run_seed_loop:
+        description: "Also fetch the ROM, build, and run the seed loop"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,7 +44,31 @@ jobs:
           sudo apt-get install -y build-essential cmake ninja-build python3 \
             libsdl2-dev xvfb
 
+      - name: Clone template game project and framework
+        run: |
+          git clone --depth 1 https://github.com/mstan/YoshiNESRecomp.git game
+          cd game
+          chmod +x setup.sh
+          ./setup.sh
+          git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
+
+      - name: Read the framework source for input and frame-dump syntax
+        continue-on-error: true
+        run: |
+          cd game
+          echo "==== docs mentioning the flags ===="
+          grep -rn -i -B1 -A6 -E -e '--input|--virtual-pad|--present-out|--shot-every' \
+            nesrecomp --include='*.md' 2>/dev/null | head -n 90 || true
+          echo "==== where --input's file is read ===="
+          grep -n 'input_file' nesrecomp/runner/cyc/cyc_host.c | head -n 20 || true
+          grep -rn -B2 -A30 -e 'fopen(input_file' nesrecomp/runner/cyc | head -n 90 || true
+          echo "==== how --shot-every is used ===="
+          grep -n -B1 -A10 -e 'shot_every' nesrecomp/runner/cyc/cyc_host.c | sed -n '1,70p' || true
+          echo "==== how --present-out is used ===="
+          grep -n -B1 -A10 -e 'present_out' nesrecomp/runner/cyc/cyc_host.c | sed -n '1,70p' || true
+
       - name: Fetch ROM from Google Drive (kept on the runner only)
+        if: ${{ inputs.run_seed_loop }}
         env:
           ROM_URL: "https://drive.google.com/uc?export=download&id=13qlBFeeqRVl-sMBtlnH5PRf9poEicja5"
           ROM_SHA1: "d536d1a6d87fa2c9d32f58f76c9545cc506fea8f"
@@ -56,15 +82,8 @@ jobs:
           echo "$ROM_SHA1  $F" | sha1sum -c -
           echo "ROM_PATH=$F" >> "$GITHUB_ENV"
 
-      - name: Clone template game project and framework
-        run: |
-          git clone --depth 1 https://github.com/mstan/YoshiNESRecomp.git game
-          cd game
-          chmod +x setup.sh
-          ./setup.sh
-          git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
-
       - name: Replace the template's Yoshi-specific config
+        if: ${{ inputs.run_seed_loop }}
         run: |
           cd game
           printf '# empty config: first boot test for an AxROM game\n' > game.toml
@@ -73,6 +92,7 @@ jobs:
           rm -rf generated
 
       - name: Build the game runner
+        if: ${{ inputs.run_seed_loop }}
         run: |
           cd game
           # The framework bundles Windows SDL2 headers (they need windows.h),
@@ -90,26 +110,13 @@ jobs:
           tail -n 20 build_full.log
           exit $STATUS
 
-      - name: Learn flag syntax from the framework source
-        continue-on-error: true
-        run: |
-          cd game
-          for flag in input virtual-pad present-out present-every shot-every; do
-            echo "---- --$flag ----"
-            grep -rn -A6 -e "\"--$flag\"" nesrecomp/runner 2>/dev/null | head -n 24 || true
-          done
-
       - name: Seed loop (baseline, seed file, rebuild, rerun, compare)
+        if: ${{ inputs.run_seed_loop }}
         continue-on-error: true
         run: |
           cd game
           EXE=$(realpath build/YoshiRecomp)
           export SDL_AUDIODRIVER=dummy
-
-          echo "---- Yoshi's original cyc_seeds.txt format (first 12 lines) ----"
-          git show HEAD:cyc_seeds.txt | head -n 12 || true
-          echo "---- how the recompiler reads seeds (source) ----"
-          grep -rn -i -A10 'seeds from' nesrecomp/recompiler/src | head -n 60 || true
 
           echo "==== 1) baseline run ===="
           (cd build && timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
@@ -120,7 +127,6 @@ jobs:
           echo "==== 2) turn the miss log into cyc_seeds.txt ===="
           grep -v '^#' build/miss.log | awk '{print $1}' > cyc_seeds.txt
           wc -l cyc_seeds.txt
-          head -n 5 cyc_seeds.txt
 
           echo "==== 3) rebuild with the seeds ===="
           set +e
@@ -129,7 +135,6 @@ jobs:
           set -e
           echo "rebuild exit status: $S"
           grep -n -i -E 'error|fatal' build_seeded.log | head -n 20 || true
-          find build/cycle-YoshiRecomp -name codegen.log -exec tail -n 4 {} \; || true
 
           echo "==== 4) rerun with the seeded build ===="
           (cd build && timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
@@ -150,5 +155,5 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
 
       # No upload-artifact step: generated C, binaries and screenshots are
-      # derived from the ROM. Next: scripted button input to get past the
-      # title screen, then repeat the seed loop with the extra coverage.
+      # derived from the ROM. Next: scripted button input, then commit the
+      # growing seed file (addresses only) back to this repo so it persists.
