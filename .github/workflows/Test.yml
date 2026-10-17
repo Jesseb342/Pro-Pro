@@ -1,13 +1,15 @@
 # .github/workflows/build.yml
-# R.C. Pro-Am II (mapper 7 / AxROM) recomp: boot test, launcher skipped.
+# R.C. Pro-Am II (mapper 7 / AxROM) recomp: headless discovery runs.
 #
-# State so far: the template (YoshiNESRecomp) builds against this ROM and the
-# game binary launches, but it sat in the pre-boot launcher menu. This run
-# tries two ways past that:
-#   A) windowed mode under a virtual display with SkipLauncher = 1 in config.ini
-#   B) the binary's own --headless / --frames / --hash-out flags
-# The flag syntax in B is guessed from strings inside the binary, so B may print
-# a usage error. Either way the log tells us the right syntax.
+# State so far: the template (YoshiNESRecomp) builds against this ROM, and the
+# binary's built-in headless mode ran 600 frames. 99.8% of the CPU work went
+# through the interpreter fallback (no code seeds yet), so the game executes but
+# is not yet statically recompiled.
+#
+# This run (flag syntax for --miss-log / --spam / --screenshot is GUESSED):
+#   C) 3600 frames with the miss log on, to see what code the game touches
+#   D) the same with random button presses, to reach beyond the title screen
+#   E) a deliberately incomplete --screenshot call, to make it print its usage
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -60,6 +62,8 @@ jobs:
       - name: Replace the template's Yoshi-specific config
         run: |
           cd game
+          echo "---- format of the template's cyc_seeds.txt (first 8 lines) ----"
+          head -n 8 cyc_seeds.txt || true
           printf '# empty config: first boot test for an AxROM game\n' > game.toml
           # Yoshi's code-seed addresses are wrong for this ROM: keep the file, empty it.
           : > cyc_seeds.txt
@@ -83,41 +87,42 @@ jobs:
           tail -n 20 build_full.log
           exit $STATUS
 
-      - name: Boot test with the launcher skipped
+      - name: Discovery runs (headless)
         continue-on-error: true
         run: |
           cd game/build
           EXE=$(realpath YoshiRecomp)
-          echo "---- every command-line flag found inside the binary ----"
-          strings -a "$EXE" | grep -E '^--[a-z][a-z0-9-]+' | sort -u | head -n 200 || true
+          export SDL_AUDIODRIVER=dummy
 
-          echo "==== Attempt A: windowed under a virtual display, launcher skipped ===="
-          printf '[Launcher]\nSkipLauncher = 1\n' > config.ini
-          timeout 30 xvfb-run -a env SDL_AUDIODRIVER=dummy "$EXE" "$ROM_PATH" \
-            > runA.log 2>&1 || echo "A exited with status $? (124 = ran until the 30 s timeout)"
-          echo "---- A: last 40 lines ----"
-          tail -n 40 runA.log
+          echo "==== C: 3600 frames (about 1 minute of game time), miss log on ===="
+          timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
+            --hash-out frames.hash --miss-log miss.log > runC.log 2>&1 \
+            || echo "C exited with status $?"
+          tail -n 15 runC.log
+          echo "---- miss.log: size and first 15 lines ----"
+          wc -l miss.log 2>/dev/null || echo "no miss.log"
+          head -n 15 miss.log 2>/dev/null || true
+          echo "---- last frames.hash line ----"
+          tail -n 1 frames.hash 2>/dev/null || true
 
-          echo "==== Attempt B: built-in headless flags (syntax guessed) ===="
-          timeout 60 env SDL_AUDIODRIVER=dummy "$EXE" --headless --frames 600 \
-            --hash-out frames.hash "$ROM_PATH" \
-            > runB.log 2>&1 || echo "B exited with status $?"
-          echo "---- B: last 40 lines ----"
-          tail -n 40 runB.log
+          echo "==== D: random button presses to reach more of the game ===="
+          timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 --spam --spam-seed 1 \
+            --miss-log miss_spam.log > runD.log 2>&1 \
+            || echo "D exited with status $?"
+          tail -n 15 runD.log
+          echo "---- miss_spam.log: size and first 15 lines ----"
+          wc -l miss_spam.log 2>/dev/null || echo "no miss_spam.log"
+          head -n 15 miss_spam.log 2>/dev/null || true
 
-          echo "---- new files next to the executable ----"
-          ls -la
-          echo "---- frames.hash (first 10 lines) ----"
-          head -n 10 frames.hash 2>/dev/null || echo "none"
-          echo "---- dispatch_misses.log (first 40 lines) ----"
-          head -n 40 dispatch_misses.log 2>/dev/null || echo "none"
-          echo "---- fallback_telemetry.jsonl (last 5 lines) ----"
-          tail -n 5 fallback_telemetry.jsonl 2>/dev/null || echo "none"
+          echo "==== E: what does --screenshot expect? (expected to print usage) ===="
+          timeout 30 "$EXE" "$ROM_PATH" --headless --frames 5 --screenshot \
+            > runE.log 2>&1 || echo "E exited with status $?"
+          tail -n 8 runE.log
 
       - name: Wipe ROM and generated code
         if: always()
         run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
 
       # No upload-artifact step: generated C, binaries and screenshots are
-      # derived from the ROM. Later: frame capture, game.toml entries from
-      # dispatch_misses.log, and the iOS wrapper on a macOS runner.
+      # derived from the ROM. Next: feed the miss log into cyc_seeds.txt,
+      # rebuild, and watch the native share of execution rise from 0.2%.
