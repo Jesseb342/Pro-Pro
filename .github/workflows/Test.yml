@@ -1,15 +1,20 @@
 # .github/workflows/build.yml
-# R.C. Pro-Am II (mapper 7 / AxROM) recomp: headless discovery runs.
+# R.C. Pro-Am II (mapper 7 / AxROM) recomp: seed loop.
 #
-# State so far: the template (YoshiNESRecomp) builds against this ROM, and the
-# binary's built-in headless mode ran 600 frames. 99.8% of the CPU work went
-# through the interpreter fallback (no code seeds yet), so the game executes but
-# is not yet statically recompiled.
+# Known so far: the template (YoshiNESRecomp) builds against this ROM and its
+# headless mode runs the game, but 99.8% of execution goes through the
+# interpreter fallback because no code seeds exist yet. In a 3600-frame run
+# only ~1,700 ROM addresses were touched: the game appears to idle at its
+# title screen because nothing presses a button.
 #
-# This run (flag syntax for --miss-log / --spam / --screenshot is GUESSED):
-#   C) 3600 frames with the miss log on, to see what code the game touches
-#   D) the same with random button presses, to reach beyond the title screen
-#   E) a deliberately incomplete --screenshot call, to make it print its usage
+# This run:
+#   1) learns the syntax of --input / --virtual-pad / --present-out from the
+#      framework SOURCE (the binary only gave flag names)
+#   2) baseline run -> miss log -> cyc_seeds.txt -> rebuild -> rerun, then
+#      compares per-frame hashes. IDENTICAL means the seeded (more compiled)
+#      build behaves exactly like the interpreter run.
+# The miss-log -> seed-file conversion is a GUESS (strip counts); the printed
+# format of Yoshi's original seed file tells us if it is right.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -29,7 +34,7 @@ concurrency:
 jobs:
   boot-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - name: Install build tools
         run: |
@@ -62,8 +67,6 @@ jobs:
       - name: Replace the template's Yoshi-specific config
         run: |
           cd game
-          echo "---- format of the template's cyc_seeds.txt (first 8 lines) ----"
-          head -n 8 cyc_seeds.txt || true
           printf '# empty config: first boot test for an AxROM game\n' > game.toml
           # Yoshi's code-seed addresses are wrong for this ROM: keep the file, empty it.
           : > cyc_seeds.txt
@@ -87,42 +90,65 @@ jobs:
           tail -n 20 build_full.log
           exit $STATUS
 
-      - name: Discovery runs (headless)
+      - name: Learn flag syntax from the framework source
         continue-on-error: true
         run: |
-          cd game/build
-          EXE=$(realpath YoshiRecomp)
+          cd game
+          for flag in input virtual-pad present-out present-every shot-every; do
+            echo "---- --$flag ----"
+            grep -rn -A6 -e "\"--$flag\"" nesrecomp/runner 2>/dev/null | head -n 24 || true
+          done
+
+      - name: Seed loop (baseline, seed file, rebuild, rerun, compare)
+        continue-on-error: true
+        run: |
+          cd game
+          EXE=$(realpath build/YoshiRecomp)
           export SDL_AUDIODRIVER=dummy
 
-          echo "==== C: 3600 frames (about 1 minute of game time), miss log on ===="
-          timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
-            --hash-out frames.hash --miss-log miss.log > runC.log 2>&1 \
-            || echo "C exited with status $?"
-          tail -n 15 runC.log
-          echo "---- miss.log: size and first 15 lines ----"
-          wc -l miss.log 2>/dev/null || echo "no miss.log"
-          head -n 15 miss.log 2>/dev/null || true
-          echo "---- last frames.hash line ----"
-          tail -n 1 frames.hash 2>/dev/null || true
+          echo "---- Yoshi's original cyc_seeds.txt format (first 12 lines) ----"
+          git show HEAD:cyc_seeds.txt | head -n 12 || true
+          echo "---- how the recompiler reads seeds (source) ----"
+          grep -rn -i -A10 'seeds from' nesrecomp/recompiler/src | head -n 60 || true
 
-          echo "==== D: random button presses to reach more of the game ===="
-          timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 --spam --spam-seed 1 \
-            --miss-log miss_spam.log > runD.log 2>&1 \
-            || echo "D exited with status $?"
-          tail -n 15 runD.log
-          echo "---- miss_spam.log: size and first 15 lines ----"
-          wc -l miss_spam.log 2>/dev/null || echo "no miss_spam.log"
-          head -n 15 miss_spam.log 2>/dev/null || true
+          echo "==== 1) baseline run ===="
+          (cd build && timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
+            --hash-out frames_base.hash --miss-log miss.log > run1.log 2>&1) \
+            || echo "baseline exited with status $?"
+          tail -n 3 build/run1.log
 
-          echo "==== E: what does --screenshot expect? (expected to print usage) ===="
-          timeout 30 "$EXE" "$ROM_PATH" --headless --frames 5 --screenshot \
-            > runE.log 2>&1 || echo "E exited with status $?"
-          tail -n 8 runE.log
+          echo "==== 2) turn the miss log into cyc_seeds.txt ===="
+          grep -v '^#' build/miss.log | awk '{print $1}' > cyc_seeds.txt
+          wc -l cyc_seeds.txt
+          head -n 5 cyc_seeds.txt
+
+          echo "==== 3) rebuild with the seeds ===="
+          set +e
+          cmake --build build > build_seeded.log 2>&1
+          S=$?
+          set -e
+          echo "rebuild exit status: $S"
+          grep -n -i -E 'error|fatal' build_seeded.log | head -n 20 || true
+          find build/cycle-YoshiRecomp -name codegen.log -exec tail -n 4 {} \; || true
+
+          echo "==== 4) rerun with the seeded build ===="
+          (cd build && timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
+            --hash-out frames_seeded.hash --miss-log miss2.log > run2.log 2>&1) \
+            || echo "seeded run exited with status $?"
+          tail -n 3 build/run2.log
+
+          echo "==== 5) does the seeded build behave identically? ===="
+          if cmp -s build/frames_base.hash build/frames_seeded.hash; then
+            echo "IDENTICAL: all 3600 frame hashes match"
+          else
+            echo "DIFFERENT: first differing lines:"
+            diff build/frames_base.hash build/frames_seeded.hash | head -n 6
+          fi
 
       - name: Wipe ROM and generated code
         if: always()
         run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
 
       # No upload-artifact step: generated C, binaries and screenshots are
-      # derived from the ROM. Next: feed the miss log into cyc_seeds.txt,
-      # rebuild, and watch the native share of execution rise from 0.2%.
+      # derived from the ROM. Next: scripted button input to get past the
+      # title screen, then repeat the seed loop with the extra coverage.
