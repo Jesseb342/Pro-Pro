@@ -1,19 +1,22 @@
 # .github/workflows/build.yml
-# R.C. Pro-Am II (mapper 7 / AxROM, 256 KB PRG, CHR-RAM) recomp: framework probe.
+# R.C. Pro-Am II (mapper 7 / AxROM) recomp: boot test.
 #
-# This run answers one question before we invest more: does upstream
-# mstan/nesrecomp accept this ROM? Its README lists mapper 7 as "not yet"
-# supported, so a failure here is informative, not a bug in this workflow.
+# Goal of this run: build a runner around the generated code using an existing
+# public NESRecomp game repo (YoshiNESRecomp, MMC1) as a TEMPLATE, then run the
+# result headless for 45 seconds and print what happened.
 #
-# ROM_URL and ROM_SHA1 are hardcoded below. Keep this repo private: anyone who
-# can read this file can read the Drive link.
+# EXPECT FAILURES. The template is written for another game, so each run will
+# probably stop at the next mismatch. The log is the point: paste the failing
+# step's output back and we fix that one thing. The template files are printed
+# on purpose so the next version can be written against the real layout.
+#
+# Template repos use the PolyForm Noncommercial license: keep this noncommercial.
+# ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
 
 name: rcproam2-recomp
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 permissions:
   contents: read
@@ -23,16 +26,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  probe:
+  boot-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build python3
+          sudo apt-get install -y build-essential cmake ninja-build python3 \
+            libsdl2-dev xvfb
 
       - name: Fetch ROM from Google Drive (kept on the runner only)
         env:
@@ -48,35 +50,71 @@ jobs:
           echo "$ROM_SHA1  $F" | sha1sum -c -
           echo "ROM_PATH=$F" >> "$GITHUB_ENV"
 
-      - name: Clone upstream nesrecomp
+      - name: Clone template game project and framework
         run: |
-          git clone --depth 1 https://github.com/mstan/nesrecomp.git framework
-          git -C framework log -1 --format='framework commit: %H (%cd)'
+          git clone --depth 1 https://github.com/mstan/YoshiNESRecomp.git game
+          cd game
+          chmod +x setup.sh
+          ./setup.sh
+          echo "---- template layout ----"
+          ls -la
+          echo "---- setup.sh (first 80 lines) ----"
+          head -n 80 setup.sh
+          echo "---- CMakeLists.txt (first 150 lines) ----"
+          head -n 150 CMakeLists.txt
+          echo "---- framework commit ----"
+          git -C nesrecomp log -1 --format='%H (%cd)' || true
+
+      - name: Replace the template's game config with an empty one
+        run: |
+          cd game
+          printf '# empty config: first boot test for an AxROM game\n' > game.toml
+          rm -rf generated
 
       - name: Build the recompiler
         run: |
-          cmake -S framework/recompiler -B framework/build/recompiler \
+          cd game
+          cmake -S nesrecomp/recompiler -B nesrecomp/build/recompiler \
             -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build framework/build/recompiler
+          cmake --build nesrecomp/build/recompiler
 
-      - name: Probe - run the recompiler on the ROM (no game config)
+      - name: Generate C from the ROM
+        run: |
+          cd game
+          nesrecomp/build/recompiler/NESRecomp "$ROM_PATH" --game game.toml
+          ls generated | head -n 40
+
+      - name: Build the game runner
+        run: |
+          cd game
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNESRECOMP_ROM="$ROM_PATH"
+          cmake --build build 2>&1 | tail -n 120
+
+      - name: Run headless for 45 seconds
         continue-on-error: true
         run: |
-          # TODO: flags are unverified; the README says game.toml is optional.
-          BIN=$(find framework/build/recompiler -maxdepth 3 -type f \
-                -iname 'NESRecomp*' -perm -u+x | head -n 1)
-          echo "recompiler binary: ${BIN:-NOT FOUND}"
-          "$BIN" "$ROM_PATH" > probe.log 2>&1 || echo "recompiler exited with status $?"
-          echo "---- last 60 lines of recompiler output ----"
-          tail -n 60 probe.log
-          echo "---- generated files ----"
-          ls -la generated 2>/dev/null | head -n 30 || echo "no generated/ directory"
+          cd game
+          EXE=$(find build -maxdepth 3 -type f -perm -u+x \
+                ! -name '*.so*' ! -name '*.a' ! -path '*CMakeFiles*' | head -n 1)
+          echo "game executable: ${EXE:-NOT FOUND}"
+          EXE=$(realpath "$EXE")
+          cd "$(dirname "$EXE")"
+          timeout 45 xvfb-run -a env SDL_AUDIODRIVER=dummy "$EXE" "$ROM_PATH" \
+            > run.log 2>&1 || echo "exited with status $? (124 = hit the 45 s timeout, which is fine)"
+          echo "---- last 60 lines of run.log ----"
+          tail -n 60 run.log
+          echo "---- files next to the executable ----"
+          ls -la
+          echo "---- dispatch_misses.log (first 40 lines) ----"
+          head -n 40 dispatch_misses.log 2>/dev/null || echo "none"
+          echo "---- fallback_telemetry.jsonl (last 5 lines) ----"
+          tail -n 5 fallback_telemetry.jsonl 2>/dev/null || echo "none"
 
       - name: Wipe ROM and generated code
         if: always()
-        run: rm -rf "$RUNNER_TEMP/rom" generated probe.log
+        run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
 
-      # No upload-artifact step: generated C and binaries are derived from the
-      # ROM. Next steps once the probe passes: game.toml for AxROM bank
-      # switching, the native runner build, headless frame checks, and an
-      # iOS wrapper (SDL3/Metal Xcode project) on a macOS runner.
+      # No upload-artifact step: generated C, binaries and screenshots are
+      # derived from the ROM. Later: frame capture, game.toml entries from
+      # dispatch_misses.log, and the iOS wrapper on a macOS runner.
