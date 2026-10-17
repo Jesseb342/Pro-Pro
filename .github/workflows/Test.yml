@@ -69,6 +69,9 @@ jobs:
         run: |
           cd game
           printf '# empty config: first boot test for an AxROM game\n' > game.toml
+          # The template ships Yoshi's code-seed addresses; they are wrong for
+          # this ROM, so leave the file present but empty.
+          : > cyc_seeds.txt
           rm -rf generated
 
       - name: Build the recompiler
@@ -87,8 +90,12 @@ jobs:
       - name: Build the game runner
         run: |
           cd game
+          # The framework bundles Windows SDL2 headers (they need windows.h),
+          # so point CMake at the Linux SDL2 installed by apt instead.
+          SDL2_CFG=$(dpkg -L libsdl2-dev | grep 'sdl2-config\.cmake$' | head -n 1)
+          echo "system SDL2 config: ${SDL2_CFG:-NOT FOUND}"
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DNESRECOMP_ROM="$ROM_PATH"
+            -DNESRECOMP_ROM="$ROM_PATH" -DSDL2_DIR="$(dirname "$SDL2_CFG")"
           set +e
           cmake --build build > build_full.log 2>&1
           STATUS=$?
