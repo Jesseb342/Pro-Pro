@@ -3,25 +3,27 @@
 #
 # PROVEN so far:
 #   - the template builds against this ROM and runs the game headless
-#   - seed loop: miss log -> cyc_seeds.txt -> rebuild gives 100% native
-#     execution with frame hashes identical to the interpreter run
-#   - screenshots show the real game with no graphical errors
-#   - scripted input works. Button names: A B SELECT START UP DOWN LEFT RIGHT,
-#     combined with "+" (for example A+RIGHT). Unknown names are ignored.
-#   - a hand-written route reached the in-game screen but the car never left
-#     the start line (it held A and steered, one button at a time), so this
-#     version stops hand-driving blind.
-#   - controls (from the player): UP/DOWN/LEFT/RIGHT steer, and A or B is gas,
-#     so playing needs a gas button AND a direction pressed together.
+#   - screenshots show the real game with no graphical errors; cars now drive
+#   - exploration works: 10 random scripts produced 10,655 seeds, which the
+#     rebuild compiled into 13,468 instructions (up from 296)
+#   - verification: on 3 UNSEEN random scripts of 6000 frames the native build's
+#     frame hashes were IDENTICAL to an --interp-only run, with 99.99%+ of
+#     cycles native
+#   Caveat: those scripts come from the same generator as the seeding scripts,
+#   so this proves coverage of what random play reaches (early menus and
+#   driving), not of the whole game (other tracks, items, endings).
+#
+# Controls: UP/DOWN/LEFT/RIGHT steer; A or B is gas. Button names combine with
+# "+" (for example A+RIGHT).
 #
 # What "explore" does (tick it when you tap "Run workflow"):
 #   1. build the game, starting from seeds/cyc_seeds.txt if this repo has one
-#   2. run 10 RANDOM button-mashing scripts of 6000 frames; the framework's miss
-#      log accumulates every ROM address the interpreter had to run
-#   3. merge those into cyc_seeds.txt and rebuild (more code compiled natively)
-#   4. verify on 3 DIFFERENT random scripts never used for seeding: the native
-#      build's per-frame hashes must equal an --interp-only run's, and the
-#      native share on unseen play shows how well the seeds generalize
+#   2. run N random scripts (three styles: button mashing, steady driving, and
+#      menu-heavy); seeds come from the run number, so every run tries NEW
+#      scripts; the framework's miss log accumulates every ROM address the
+#      interpreter had to run
+#   3. merge those into cyc_seeds.txt and rebuild
+#   4. verify on 3 FIXED unseen scripts: native hashes must equal --interp-only
 # Optional: save_screenshots uploads a few PNG frames (private, 1 day);
 #           commit_seeds pushes the seed file (addresses only) back to this repo
 #           so the next run starts where this one stopped.
@@ -38,6 +40,14 @@ on:
         description: "Fetch the ROM, build, explore with random input, seed, verify"
         type: boolean
         default: true
+      scripts:
+        description: "How many random scripts to run for exploration"
+        type: string
+        default: "12"
+      frames:
+        description: "Frames per exploration script (60 frames = 1 second)"
+        type: string
+        default: "6000"
       save_screenshots:
         description: "Upload a few PNG frames from the verification runs (private, 1 day)"
         type: boolean
@@ -55,7 +65,7 @@ jobs:
   explore:
     if: ${{ inputs.explore }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     # Write access is only used by the optional "commit seeds" step, which
     # passes the token explicitly. Checkout does not persist it, so the
     # third-party build scripts below never see it.
@@ -127,13 +137,20 @@ jobs:
           exit $STATUS
 
       - name: Explore with random input (accumulate the miss log)
+        env:
+          SCRIPTS: ${{ inputs.scripts }}
+          FRAMES: ${{ inputs.frames }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           cd game/build
           export SDL_AUDIODRIVER=dummy
+          case "$SCRIPTS" in ''|*[!0-9]*) SCRIPTS=12 ;; esac
+          case "$FRAMES"  in ''|*[!0-9]*) FRAMES=6000 ;; esac
           cat > gen_route.py <<'PY'
           import random, sys
           seed, out, frames = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
           rng = random.Random(seed)
+          profile = seed % 3   # 0 mashing, 1 steady driving, 2 menu-heavy
           # Controls: UP/DOWN/LEFT/RIGHT steer; A or B is gas (we do not know
           # which), so most steps hold a gas button together with a direction.
           choices = [("A+LEFT", 10), ("A+RIGHT", 10), ("A", 8),
@@ -149,25 +166,44 @@ jobs:
               lines.append(f"{t} {rng.choice(['START', 'A'])}")
               lines.append(f"{t + 6} -")
               t += rng.randint(40, 90)
-          while t < frames - 60:               # play phase: random mashing
-              lines.append(f"{t} {rng.choice(names)}")
-              t += rng.randint(5, 45)
+          while t < frames - 60:
+              if profile == 0:                 # random button mashing
+                  lines.append(f"{t} {rng.choice(names)}")
+                  t += rng.randint(5, 45)
+              elif profile == 1:               # steady driving
+                  gas = rng.choice(["A", "B"])
+                  steer = rng.choice(["", "+LEFT", "+RIGHT", "+LEFT", "+RIGHT"])
+                  lines.append(f"{t} {gas}{steer}")
+                  t += rng.randint(20, 120)
+              else:                            # menu taps with driving bursts
+                  if rng.random() < 0.6:
+                      btn = rng.choice(["START", "A", "B", "UP", "DOWN", "SELECT"])
+                      lines.append(f"{t} {btn}")
+                      lines.append(f"{t + 6} -")
+                      t += rng.randint(30, 120)
+                  else:
+                      gas = rng.choice(["A", "B"])
+                      steer = rng.choice(["+LEFT", "+RIGHT", ""])
+                      lines.append(f"{t} {gas}{steer}")
+                      t += rng.randint(60, 200)
           with open(out, "w") as f:
               f.write("\n".join(lines) + "\n")
           PY
           rm -f miss_all.log
-          for s in 101 102 103 104 105 106 107 108 109 110; do
-            python3 gen_route.py "$s" "route_$s.txt" 6000
-            timeout 300 ./YoshiRecomp "$ROM_PATH" --headless --frames 6000 \
+          for i in $(seq 1 "$SCRIPTS"); do
+            s=$((RUN_NUMBER * 100 + i))
+            python3 gen_route.py "$s" "route_$s.txt" "$FRAMES"
+            timeout 600 ./YoshiRecomp "$ROM_PATH" --headless --frames "$FRAMES" \
               --input "route_$s.txt" --miss-log miss_all.log > "run_$s.log" 2>&1 \
               || echo "route $s exited with status $?"
-            echo "after route $s: $(grep -c -v '^#' miss_all.log 2>/dev/null) distinct addresses so far | $(grep -m1 '^mode=' "run_$s.log")"
+            echo "after route $s (style $((s % 3))): $(grep -c -v '^#' miss_all.log 2>/dev/null) distinct addresses so far | $(grep -m1 '^mode=' "run_$s.log")"
           done
 
       - name: Merge the seeds and rebuild
         run: |
           cd game
           grep -v '^#' build/miss_all.log | awk '{print $1}' > new_seeds.txt
+          echo "NEW this run: $(sort -u new_seeds.txt | wc -l) addresses the saved seeds did not cover"
           cat cyc_seeds.txt new_seeds.txt | grep -v '^#' | sort -u > merged.txt
           mv merged.txt cyc_seeds.txt
           echo "SEEDS: $(wc -l < cyc_seeds.txt) addresses in cyc_seeds.txt"
@@ -185,13 +221,15 @@ jobs:
           cd game/build
           export SDL_AUDIODRIVER=dummy
           mkdir -p shots
-          for s in 901 902 903; do
+          # Fixed seeds far above any exploration seed; 900001-900003 cover all
+          # three script styles.
+          for s in 900001 900002 900003; do
             python3 gen_route.py "$s" "route_$s.txt" 6000
             timeout 300 ./YoshiRecomp "$ROM_PATH" --headless --frames 6000 \
               --input "route_$s.txt" --hash-out "hash_native_$s.txt" \
               --screenshot "shots/seed$s.png" --shot-every 1000 \
               > "run_native_$s.log" 2>&1 || echo "native $s exited with status $?"
-            timeout 600 ./YoshiRecomp "$ROM_PATH" --headless --interp-only --frames 6000 \
+            timeout 900 ./YoshiRecomp "$ROM_PATH" --headless --interp-only --frames 6000 \
               --input "route_$s.txt" --hash-out "hash_interp_$s.txt" \
               > "run_interp_$s.log" 2>&1 || echo "interp $s exited with status $?"
             if cmp -s "hash_native_$s.txt" "hash_interp_$s.txt"; then
@@ -199,7 +237,7 @@ jobs:
             else
               r=DIFFERENT
             fi
-            echo "VERIFY unseen script $s: frame hashes $r | $(grep -m1 '^mode=' "run_native_$s.log")"
+            echo "VERIFY unseen script $s (style $((s % 3))): frame hashes $r | $(grep -m1 '^mode=' "run_native_$s.log")"
           done
 
       - name: Upload screenshots (private artifact, kept 1 day)
