@@ -333,8 +333,15 @@ jobs:
           SDL2_DIR_BREW="$(brew --prefix sdl2)/lib/cmake/SDL2"
           echo "SDL2 config dir: $SDL2_DIR_BREW"
           ls "$SDL2_DIR_BREW" | head -n 5 || true
+          # AppleClang makes "call to undeclared function" an ERROR; GCC on Linux
+          # only warns. hw_fds.c (Famicom Disk System code, unused by this
+          # cartridge game) calls cyc_trace_mix without a declaration, so
+          # downgrade that diagnostic and show where the function is declared.
+          echo "---- where cyc_trace_mix appears ----"
+          grep -rn 'cyc_trace_mix' nesrecomp/runner --include='*.c' --include='*.h' | head -n 12 || true
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DNESRECOMP_ROM="$ROM_PATH" -DSDL2_DIR="$SDL2_DIR_BREW"
+            -DNESRECOMP_ROM="$ROM_PATH" -DSDL2_DIR="$SDL2_DIR_BREW" \
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration"
           set +e
           cmake --build build > build_full.log 2>&1
           STATUS=$?
