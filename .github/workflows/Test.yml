@@ -3,20 +3,21 @@
 #
 # PROVEN so far:
 #   - the template builds against this ROM and runs the game headless
-#   - the seed loop (miss log -> cyc_seeds.txt -> rebuild) gives 100% native
-#     execution with all 3600 frame hashes identical to the interpreter run
+#   - seed loop: miss log -> cyc_seeds.txt -> rebuild gives 100% native
+#     execution with frame hashes identical to the interpreter run
 #   - screenshots show the real game with no graphical errors (title screen)
-# KNOWN about --input files: one step per line, "FRAME [PORT:]BUTTONS", where
-# "-" releases everything, "#" starts a comment, and the buttons stay held until
-# the next step. The button NAMES come from parse_buttons(), which we print.
+#   - scripted input works: button names are words, case-insensitive. START and
+#     A are accepted ("T" is not). One scripted run touched 8,055 code addresses
+#     in 1,600 frames versus 1,372 with no input.
 #
 # Options when you tap "Run workflow":
-#   run_seed_loop    fetch the ROM, build, and repeat the seed loop
-#   save_screenshots fetch the ROM, build, and upload PNG frames (private, 1 day)
-#   try_input        fetch the ROM, build, and try several button-name styles in
-#                    a scripted input file; the one that makes the game touch
-#                    MORE code than the no-input baseline is the right one
-# With all unticked it only reads the framework source (parse_buttons).
+#   run_seed_loop     fetch the ROM, build, run the seed loop (no input script)
+#   try_input         fetch the ROM, build, run a scripted route of 5,400 frames
+#                     (menu taps, then drive with A and steer LEFT/RIGHT) and
+#                     report how much of the game it reached
+#   save_screenshots  with try_input: also upload PNG frames of the route as a
+#                     PRIVATE artifact kept 1 day (game screens: keep the repo
+#                     private and delete the artifact afterwards)
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -30,12 +31,12 @@ on:
         description: "Fetch the ROM, build, and run the seed loop"
         type: boolean
         default: false
-      save_screenshots:
-        description: "Fetch the ROM, build, and upload PNG frames (private, 1 day)"
+      try_input:
+        description: "Fetch the ROM, build, and run the scripted route"
         type: boolean
         default: false
-      try_input:
-        description: "Fetch the ROM, build, and try scripted button input"
+      save_screenshots:
+        description: "With the route: upload PNG frames (private, 1 day)"
         type: boolean
         default: false
 
@@ -65,16 +66,8 @@ jobs:
           ./setup.sh
           git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
 
-      - name: Read the framework source for the button names (parse_buttons)
-        continue-on-error: true
-        run: |
-          cd game
-          echo "==== parse_buttons ===="
-          grep -n 'parse_buttons' nesrecomp/runner/cyc/cyc_host.c | head -n 10 || true
-          grep -n -A45 -e 'parse_buttons(const char' nesrecomp/runner/cyc/cyc_host.c | head -n 90 || true
-
       - name: Fetch ROM from Google Drive (kept on the runner only)
-        if: ${{ inputs.run_seed_loop || inputs.save_screenshots || inputs.try_input }}
+        if: ${{ inputs.run_seed_loop || inputs.try_input }}
         env:
           ROM_URL: "https://drive.google.com/uc?export=download&id=13qlBFeeqRVl-sMBtlnH5PRf9poEicja5"
           ROM_SHA1: "d536d1a6d87fa2c9d32f58f76c9545cc506fea8f"
@@ -89,7 +82,7 @@ jobs:
           echo "ROM_PATH=$F" >> "$GITHUB_ENV"
 
       - name: Replace the template's Yoshi-specific config
-        if: ${{ inputs.run_seed_loop || inputs.save_screenshots || inputs.try_input }}
+        if: ${{ inputs.run_seed_loop || inputs.try_input }}
         run: |
           cd game
           printf '# empty config: first boot test for an AxROM game\n' > game.toml
@@ -98,7 +91,7 @@ jobs:
           rm -rf generated
 
       - name: Build the game runner
-        if: ${{ inputs.run_seed_loop || inputs.save_screenshots || inputs.try_input }}
+        if: ${{ inputs.run_seed_loop || inputs.try_input }}
         run: |
           cd game
           # The framework bundles Windows SDL2 headers (they need windows.h),
@@ -116,51 +109,63 @@ jobs:
           tail -n 20 build_full.log
           exit $STATUS
 
-      - name: Input format trials (headless)
+      - name: Scripted route run (headless)
         if: ${{ inputs.try_input }}
         continue-on-error: true
         run: |
-          cd game/build
+          cd game
+
+          echo "==== button-name parser (searched across the runner source) ===="
+          grep -rn 'parse_buttons' nesrecomp/runner --include='*.c' --include='*.h' | head -n 10 || true
+          grep -rn -A45 -E '(uint8_t|unsigned( char)?|int) +parse_buttons *\(' \
+            nesrecomp/runner --include='*.c' --include='*.h' | head -n 90 || true
+
+          cd build
           export SDL_AUDIODRIVER=dummy
+          mkdir -p shots
 
-          echo "==== baseline: no input, 1600 frames ===="
-          timeout 150 ./YoshiRecomp "$ROM_PATH" --headless --frames 1600 \
-            --miss-log miss_base.log --hash-out hash_base.txt > run_base.log 2>&1 \
-            || echo "baseline exited with status $?"
-          N=$(grep -c -v '^#' miss_base.log 2>/dev/null || true)
-          echo "RESULT baseline: distinct interpreted addresses: ${N:-0}"
+          # Route: tap START / A alternately through the menus (11 taps, one per
+          # 60 frames from frame 120), then drive: hold A, nudge LEFT then RIGHT,
+          # until about frame 5300. A button stays held until the next step, and
+          # a step with only "-" releases everything. Names that the game does not
+          # recognize are ignored by the parser, which just releases the buttons.
+          : > route1.txt
+          t=120
+          for i in $(seq 1 11); do
+            if [ $((i % 2)) -eq 1 ]; then b=START; else b=A; fi
+            echo "$t $b" >> route1.txt
+            echo "$((t + 6)) -" >> route1.txt
+            t=$((t + 60))
+          done
+          while [ "$t" -lt 5300 ]; do
+            echo "$t A" >> route1.txt;     t=$((t + 90))
+            echo "$t LEFT" >> route1.txt;  t=$((t + 15))
+            echo "$t A" >> route1.txt;     t=$((t + 90))
+            echo "$t RIGHT" >> route1.txt; t=$((t + 15))
+          done
+          echo "$t -" >> route1.txt
+          echo "---- first 12 lines of the route ----"
+          head -n 12 route1.txt
 
-          # Each case taps a "start" button then an "A" button every 60 frames
-          # from frame 120 (release with "-"), using a different naming style.
-          run_case () {
-            name=$1; tok=$2; tok2=$3
-            : > "in_$name.txt"
-            for f in $(seq 120 60 1500); do
-              echo "$f $tok" >> "in_$name.txt"
-              echo "$((f + 6)) -" >> "in_$name.txt"
-              echo "$((f + 30)) $tok2" >> "in_$name.txt"
-              echo "$((f + 36)) -" >> "in_$name.txt"
-            done
-            timeout 150 ./YoshiRecomp "$ROM_PATH" --headless --frames 1600 \
-              --input "in_$name.txt" --miss-log "miss_$name.log" \
-              --hash-out "hash_$name.txt" > "run_$name.log" 2>&1 \
-              || echo "$name exited with status $?"
-            n=$(grep -c -v '^#' "miss_$name.log" 2>/dev/null || true)
-            same="differ from baseline"
-            if cmp -s hash_base.txt "hash_$name.txt"; then
-              same="IDENTICAL to baseline (input had no effect)"
-            fi
-            echo "RESULT $name ($tok / $tok2): $(grep -m1 '^input:' "run_$name.log" || echo 'no input line') | distinct interpreted addresses: ${n:-0} | frame hashes $same"
-          }
+          echo "==== run: 5400 frames with the route ===="
+          timeout 240 ./YoshiRecomp "$ROM_PATH" --headless --frames 5400 \
+            --input route1.txt --miss-log miss_route1.log \
+            --hash-out hash_route1.txt \
+            --screenshot shots/route.png --shot-every 450 > run_route1.log 2>&1 \
+            || echo "route run exited with status $?"
+          tail -n 6 run_route1.log
+          N=$(grep -c -v '^#' miss_route1.log 2>/dev/null || true)
+          echo "RESULT route1: distinct interpreted addresses: ${N:-0} (no input, 3600 frames: 1,720; trial with START/A taps, 1600 frames: 8,055)"
+          ls shots | head -n 20
 
-          echo "==== trials ===="
-          run_case words START A
-          run_case letters T A
-          run_case lower start a
-          run_case mixed Start A
-
-          echo "==== last 5 lines of the first trial's log ===="
-          tail -n 5 run_words.log
+      - name: Upload route screenshots (private artifact, kept 1 day)
+        if: ${{ inputs.try_input && inputs.save_screenshots }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: route-screenshots
+          path: game/build/shots/*.png
+          retention-days: 1
+          if-no-files-found: warn
 
       - name: Seed loop (baseline, seed file, rebuild, rerun, compare)
         if: ${{ inputs.run_seed_loop }}
@@ -202,33 +207,10 @@ jobs:
             diff build/frames_base.hash build/frames_seeded.hash | head -n 6
           fi
 
-      - name: Capture screenshots (headless)
-        if: ${{ inputs.save_screenshots }}
-        continue-on-error: true
-        run: |
-          cd game/build
-          mkdir -p shots
-          export SDL_AUDIODRIVER=dummy
-          # --shot-every N writes a numbered 256x240 PNG every N frames.
-          timeout 150 ./YoshiRecomp "$ROM_PATH" --headless --frames 3600 \
-            --screenshot shots/frame.png --shot-every 600 > shots.log 2>&1 \
-            || echo "exited with status $?"
-          tail -n 5 shots.log
-          ls -la shots
-
-      - name: Upload screenshots (private artifact, kept 1 day)
-        if: ${{ inputs.save_screenshots }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: game/build/shots/*.png
-          retention-days: 1
-          if-no-files-found: warn
-
       - name: Wipe ROM and generated code
         if: always()
         run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
 
-      # Next: once the right button names are known, write a real route (title,
-      # menu, a race) as an --input file, run the seed loop with it, and commit
-      # the growing seed file (addresses only) back to this repo.
+      # Next: run the seed loop WITH the route (so the seed file covers menus and
+      # racing, not just the title screen), verify identical hashes, then commit
+      # the seed file (addresses only) back to this repo so progress persists.
