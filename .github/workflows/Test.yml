@@ -1,32 +1,32 @@
 # .github/workflows/build.yml
 # R.C. Pro-Am II (mapper 7 / AxROM) recomp on the NESRecomp cycle backend.
 #
-# PROVEN so far:
+# PROVEN so far (Linux runner):
 #   - the template builds against this ROM and runs the game headless
-#   - screenshots show the real game with no graphical errors; cars now drive
-#   - exploration works: 10 random scripts produced 10,655 seeds, which the
-#     rebuild compiled into 13,468 instructions (up from 296)
-#   - verification: on 3 UNSEEN random scripts of 6000 frames the native build's
-#     frame hashes were IDENTICAL to an --interp-only run, with 99.99%+ of
-#     cycles native
-#   Caveat: those scripts come from the same generator as the seeding scripts,
-#   so this proves coverage of what random play reaches (early menus and
-#   driving), not of the whole game (other tracks, items, endings).
+#   - screenshots show the real game with no graphical errors; cars drive
+#   - random-input exploration seeded 13,000+ compiled instructions; the
+#     seeded native build's frame hashes were IDENTICAL to an --interp-only run
+#     on 3 unseen scripts, with 99.99%+ of cycles native
+#   - coverage plateaued: run 2 found only 35 new addresses
+#   Caveat: that proves coverage of what random play reaches, not the whole game.
 #
-# Controls: UP/DOWN/LEFT/RIGHT steer; A or B is gas. Button names combine with
-# "+" (for example A+RIGHT).
+# Controls: UP/DOWN/LEFT/RIGHT steer; A or B is gas. Names combine with "+".
 #
-# What "explore" does (tick it when you tap "Run workflow"):
-#   1. build the game, starting from seeds/cyc_seeds.txt if this repo has one
-#   2. run N random scripts (three styles: button mashing, steady driving, and
-#      menu-heavy); seeds come from the run number, so every run tries NEW
-#      scripts; the framework's miss log accumulates every ROM address the
-#      interpreter had to run
-#   3. merge those into cyc_seeds.txt and rebuild
-#   4. verify on 3 FIXED unseen scripts: native hashes must equal --interp-only
-# Optional: save_screenshots uploads a few PNG frames (private, 1 day);
-#           commit_seeds pushes the seed file (addresses only) back to this repo
-#           so the next run starts where this one stopped.
+# GOAL: an iOS app with 1x-4x display scaling. NES output is 256x240, so "4x"
+# means crisp integer pixel scaling (up to 1024x960), plus Auto and framing
+# options. The N64 projects this is modeled on (BananaPad, PaperPad) get their
+# 1x-4x INTERNAL resolution from the RT64 3D renderer, which a 2D NES game has
+# no equivalent of; real extra detail would need HD texture packs.
+#
+# Options when you tap "Run workflow":
+#   explore          Linux: build, explore with random input, seed, verify
+#   scripts, frames  size of the exploration
+#   save_screenshots upload a few PNG frames (private, 1 day)
+#   commit_seeds     commit seeds/cyc_seeds.txt (addresses only) to this repo
+#   macos_verify     macOS (Apple Silicon): build the same game from the saved
+#                    seeds and run the same 3 unseen scripts. The printed
+#                    "HASHSUM" lines should match the Linux ones exactly.
+#                    macOS minutes cost a multiple of Linux minutes: check your plan.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -37,9 +37,9 @@ on:
   workflow_dispatch:
     inputs:
       explore:
-        description: "Fetch the ROM, build, explore with random input, seed, verify"
+        description: "Linux: fetch the ROM, build, explore with random input, seed, verify"
         type: boolean
-        default: true
+        default: false
       scripts:
         description: "How many random scripts to run for exploration"
         type: string
@@ -49,17 +49,67 @@ on:
         type: string
         default: "6000"
       save_screenshots:
-        description: "Upload a few PNG frames from the verification runs (private, 1 day)"
+        description: "Upload a few PNG frames from the Linux verification runs (private, 1 day)"
         type: boolean
         default: false
       commit_seeds:
         description: "Commit seeds/cyc_seeds.txt (addresses only) back to this repo"
         type: boolean
         default: false
+      macos_verify:
+        description: "macOS: build from the saved seeds and verify the same unseen scripts"
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Random input-script generator, shared by the Linux and macOS jobs so both
+  # produce byte-identical scripts for the same seed.
+  GEN_ROUTE_PY: |
+    import random, sys
+    seed, out, frames = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+    rng = random.Random(seed)
+    profile = seed % 3   # 0 mashing, 1 steady driving, 2 menu-heavy
+    # Controls: UP/DOWN/LEFT/RIGHT steer; A or B is gas (we do not know
+    # which), so most steps hold a gas button together with a direction.
+    choices = [("A+LEFT", 10), ("A+RIGHT", 10), ("A", 8),
+               ("B+LEFT", 10), ("B+RIGHT", 10), ("B", 8),
+               ("A+B", 4), ("A+B+LEFT", 3), ("A+B+RIGHT", 3),
+               ("A+UP", 2), ("A+DOWN", 2), ("B+UP", 2), ("B+DOWN", 2),
+               ("LEFT", 3), ("RIGHT", 3), ("UP", 2), ("DOWN", 2),
+               ("START", 2), ("SELECT", 1), ("-", 5)]
+    names = [c for c, w in choices for _ in range(w)]
+    lines = []
+    t = 100
+    while t < 900:                       # menu phase: tap START / A
+        lines.append(f"{t} {rng.choice(['START', 'A'])}")
+        lines.append(f"{t + 6} -")
+        t += rng.randint(40, 90)
+    while t < frames - 60:
+        if profile == 0:                 # random button mashing
+            lines.append(f"{t} {rng.choice(names)}")
+            t += rng.randint(5, 45)
+        elif profile == 1:               # steady driving
+            gas = rng.choice(["A", "B"])
+            steer = rng.choice(["", "+LEFT", "+RIGHT", "+LEFT", "+RIGHT"])
+            lines.append(f"{t} {gas}{steer}")
+            t += rng.randint(20, 120)
+        else:                            # menu taps with driving bursts
+            if rng.random() < 0.6:
+                btn = rng.choice(["START", "A", "B", "UP", "DOWN", "SELECT"])
+                lines.append(f"{t} {btn}")
+                lines.append(f"{t + 6} -")
+                t += rng.randint(30, 120)
+            else:
+                gas = rng.choice(["A", "B"])
+                steer = rng.choice(["+LEFT", "+RIGHT", ""])
+                lines.append(f"{t} {gas}{steer}")
+                t += rng.randint(60, 200)
+    with open(out, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 jobs:
   explore:
@@ -146,49 +196,7 @@ jobs:
           export SDL_AUDIODRIVER=dummy
           case "$SCRIPTS" in ''|*[!0-9]*) SCRIPTS=12 ;; esac
           case "$FRAMES"  in ''|*[!0-9]*) FRAMES=6000 ;; esac
-          cat > gen_route.py <<'PY'
-          import random, sys
-          seed, out, frames = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-          rng = random.Random(seed)
-          profile = seed % 3   # 0 mashing, 1 steady driving, 2 menu-heavy
-          # Controls: UP/DOWN/LEFT/RIGHT steer; A or B is gas (we do not know
-          # which), so most steps hold a gas button together with a direction.
-          choices = [("A+LEFT", 10), ("A+RIGHT", 10), ("A", 8),
-                     ("B+LEFT", 10), ("B+RIGHT", 10), ("B", 8),
-                     ("A+B", 4), ("A+B+LEFT", 3), ("A+B+RIGHT", 3),
-                     ("A+UP", 2), ("A+DOWN", 2), ("B+UP", 2), ("B+DOWN", 2),
-                     ("LEFT", 3), ("RIGHT", 3), ("UP", 2), ("DOWN", 2),
-                     ("START", 2), ("SELECT", 1), ("-", 5)]
-          names = [c for c, w in choices for _ in range(w)]
-          lines = []
-          t = 100
-          while t < 900:                       # menu phase: tap START / A
-              lines.append(f"{t} {rng.choice(['START', 'A'])}")
-              lines.append(f"{t + 6} -")
-              t += rng.randint(40, 90)
-          while t < frames - 60:
-              if profile == 0:                 # random button mashing
-                  lines.append(f"{t} {rng.choice(names)}")
-                  t += rng.randint(5, 45)
-              elif profile == 1:               # steady driving
-                  gas = rng.choice(["A", "B"])
-                  steer = rng.choice(["", "+LEFT", "+RIGHT", "+LEFT", "+RIGHT"])
-                  lines.append(f"{t} {gas}{steer}")
-                  t += rng.randint(20, 120)
-              else:                            # menu taps with driving bursts
-                  if rng.random() < 0.6:
-                      btn = rng.choice(["START", "A", "B", "UP", "DOWN", "SELECT"])
-                      lines.append(f"{t} {btn}")
-                      lines.append(f"{t + 6} -")
-                      t += rng.randint(30, 120)
-                  else:
-                      gas = rng.choice(["A", "B"])
-                      steer = rng.choice(["+LEFT", "+RIGHT", ""])
-                      lines.append(f"{t} {gas}{steer}")
-                      t += rng.randint(60, 200)
-          with open(out, "w") as f:
-              f.write("\n".join(lines) + "\n")
-          PY
+          printf '%s\n' "$GEN_ROUTE_PY" > gen_route.py
           rm -f miss_all.log
           for i in $(seq 1 "$SCRIPTS"); do
             s=$((RUN_NUMBER * 100 + i))
@@ -238,6 +246,7 @@ jobs:
               r=DIFFERENT
             fi
             echo "VERIFY unseen script $s (style $((s % 3))): frame hashes $r | $(grep -m1 '^mode=' "run_native_$s.log")"
+            echo "HASHSUM linux $s: $(sha256sum "hash_native_$s.txt" | cut -d' ' -f1)"
           done
 
       - name: Upload screenshots (private artifact, kept 1 day)
@@ -262,6 +271,103 @@ jobs:
             || { echo "nothing to commit"; exit 0; }
           git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
             "HEAD:${{ github.ref_name }}"
+
+      - name: Wipe ROM and generated code
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
+
+  macos:
+    if: ${{ inputs.macos_verify }}
+    runs-on: macos-14   # Apple Silicon (arm64)
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install build tools
+        run: brew install ninja sdl2
+
+      - name: Clone template game project and framework
+        run: |
+          git clone --depth 1 https://github.com/mstan/YoshiNESRecomp.git game
+          cd game
+          chmod +x setup.sh
+          ./setup.sh
+          git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
+
+      - name: Fetch ROM from Google Drive (kept on the runner only)
+        env:
+          ROM_URL: "https://drive.google.com/uc?export=download&id=13qlBFeeqRVl-sMBtlnH5PRf9poEicja5"
+          ROM_SHA1: "d536d1a6d87fa2c9d32f58f76c9545cc506fea8f"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rom"
+          F="$RUNNER_TEMP/rom/game.nes"
+          curl -fsSL --retry 3 -o "$F" "$ROM_URL"
+          head -c 4 "$F" | grep -q '^NES' \
+            || { echo "Download is not an iNES file (bad link or Drive error)"; exit 1; }
+          echo "$ROM_SHA1  $F" | shasum -a 1 -c -
+          echo "ROM_PATH=$F" >> "$GITHUB_ENV"
+
+      - name: Prepare config and the saved seeds
+        run: |
+          cd game
+          printf '# empty config: AxROM game, seeds come from exploration\n' > game.toml
+          rm -rf generated
+          if [ -f "$GITHUB_WORKSPACE/seeds/cyc_seeds.txt" ]; then
+            cp "$GITHUB_WORKSPACE/seeds/cyc_seeds.txt" cyc_seeds.txt
+            echo "using $(wc -l < cyc_seeds.txt | tr -d ' ') saved seeds"
+          else
+            : > cyc_seeds.txt
+            echo "NO saved seeds in the repo (seeds/cyc_seeds.txt): building unseeded"
+          fi
+
+      - name: Build the game runner (macOS arm64)
+        run: |
+          cd game
+          # Same issue as Linux: the framework bundles Windows SDL2, so point
+          # CMake at Homebrew's SDL2 instead.
+          SDL2_DIR_BREW="$(brew --prefix sdl2)/lib/cmake/SDL2"
+          echo "SDL2 config dir: $SDL2_DIR_BREW"
+          ls "$SDL2_DIR_BREW" | head -n 5 || true
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNESRECOMP_ROM="$ROM_PATH" -DSDL2_DIR="$SDL2_DIR_BREW"
+          set +e
+          cmake --build build > build_full.log 2>&1
+          STATUS=$?
+          set -e
+          echo "build exit status: $STATUS"
+          grep -n -i -E 'error|fatal|undefined' build_full.log | head -n 40 || true
+          tail -n 10 build_full.log
+          find build/cycle-YoshiRecomp -name codegen.log -exec grep -h 'instructions compiled' {} \; || true
+          exit $STATUS
+
+      - name: Verify on macOS (same unseen scripts as Linux)
+        timeout-minutes: 35
+        run: |
+          cd game/build
+          export SDL_AUDIODRIVER=dummy
+          printf '%s\n' "$GEN_ROUTE_PY" > gen_route.py
+          # macOS has no GNU timeout: the step's timeout-minutes limit applies.
+          for s in 900001 900002 900003; do
+            python3 gen_route.py "$s" "route_$s.txt" 6000
+            ./YoshiRecomp "$ROM_PATH" --headless --frames 6000 \
+              --input "route_$s.txt" --hash-out "hash_native_$s.txt" \
+              > "run_native_$s.log" 2>&1 || echo "native $s exited with status $?"
+            echo "HASHSUM macos $s: $(shasum -a 256 "hash_native_$s.txt" | cut -d' ' -f1) | $(grep -m1 '^mode=' "run_native_$s.log")"
+          done
+          # Interpreter-only check on one script (native vs interpreter, on macOS).
+          ./YoshiRecomp "$ROM_PATH" --headless --interp-only --frames 6000 \
+            --input route_900001.txt --hash-out hash_interp_900001.txt \
+            > run_interp_900001.log 2>&1 || echo "interp exited with status $?"
+          if cmp -s hash_native_900001.txt hash_interp_900001.txt; then
+            echo "VERIFY macos 900001: native vs interp-only IDENTICAL"
+          else
+            echo "VERIFY macos 900001: native vs interp-only DIFFERENT"
+          fi
 
       - name: Wipe ROM and generated code
         if: always()
