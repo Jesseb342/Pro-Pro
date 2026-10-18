@@ -5,19 +5,26 @@
 #   - the template builds against this ROM and runs the game headless
 #   - seed loop: miss log -> cyc_seeds.txt -> rebuild gives 100% native
 #     execution with frame hashes identical to the interpreter run
-#   - screenshots show the real game with no graphical errors (title screen)
-#   - scripted input works: button names are words, case-insensitive. START and
-#     A are accepted ("T" is not). One scripted run touched 8,055 code addresses
-#     in 1,600 frames versus 1,372 with no input.
+#   - screenshots show the real game with no graphical errors
+#   - scripted input works. Button names: A B SELECT START UP DOWN LEFT RIGHT,
+#     combined with "+" (for example A+RIGHT). Unknown names are ignored.
+#   - a hand-written route reached the in-game screen but the car never left
+#     the start line (it held A and steered, one button at a time), so this
+#     version stops hand-driving blind.
+#   - controls (from the player): UP/DOWN/LEFT/RIGHT steer, and A or B is gas,
+#     so playing needs a gas button AND a direction pressed together.
 #
-# Options when you tap "Run workflow":
-#   run_seed_loop     fetch the ROM, build, run the seed loop (no input script)
-#   try_input         fetch the ROM, build, run a scripted route of 5,400 frames
-#                     (menu taps, then drive with A and steer LEFT/RIGHT) and
-#                     report how much of the game it reached
-#   save_screenshots  with try_input: also upload PNG frames of the route as a
-#                     PRIVATE artifact kept 1 day (game screens: keep the repo
-#                     private and delete the artifact afterwards)
+# What "explore" does (tick it when you tap "Run workflow"):
+#   1. build the game, starting from seeds/cyc_seeds.txt if this repo has one
+#   2. run 10 RANDOM button-mashing scripts of 6000 frames; the framework's miss
+#      log accumulates every ROM address the interpreter had to run
+#   3. merge those into cyc_seeds.txt and rebuild (more code compiled natively)
+#   4. verify on 3 DIFFERENT random scripts never used for seeding: the native
+#      build's per-frame hashes must equal an --interp-only run's, and the
+#      native share on unseen play shows how well the seeds generalize
+# Optional: save_screenshots uploads a few PNG frames (private, 1 day);
+#           commit_seeds pushes the seed file (addresses only) back to this repo
+#           so the next run starts where this one stopped.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -27,31 +34,38 @@ name: rcproam2-recomp
 on:
   workflow_dispatch:
     inputs:
-      run_seed_loop:
-        description: "Fetch the ROM, build, and run the seed loop"
+      explore:
+        description: "Fetch the ROM, build, explore with random input, seed, verify"
         type: boolean
-        default: false
-      try_input:
-        description: "Fetch the ROM, build, and run the scripted route"
-        type: boolean
-        default: false
+        default: true
       save_screenshots:
-        description: "With the route: upload PNG frames (private, 1 day)"
+        description: "Upload a few PNG frames from the verification runs (private, 1 day)"
         type: boolean
         default: false
-
-permissions:
-  contents: read
+      commit_seeds:
+        description: "Commit seeds/cyc_seeds.txt (addresses only) back to this repo"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  boot-test:
+  explore:
+    if: ${{ inputs.explore }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # Write access is only used by the optional "commit seeds" step, which
+    # passes the token explicitly. Checkout does not persist it, so the
+    # third-party build scripts below never see it.
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -67,7 +81,6 @@ jobs:
           git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
 
       - name: Fetch ROM from Google Drive (kept on the runner only)
-        if: ${{ inputs.run_seed_loop || inputs.try_input }}
         env:
           ROM_URL: "https://drive.google.com/uc?export=download&id=13qlBFeeqRVl-sMBtlnH5PRf9poEicja5"
           ROM_SHA1: "d536d1a6d87fa2c9d32f58f76c9545cc506fea8f"
@@ -81,17 +94,21 @@ jobs:
           echo "$ROM_SHA1  $F" | sha1sum -c -
           echo "ROM_PATH=$F" >> "$GITHUB_ENV"
 
-      - name: Replace the template's Yoshi-specific config
-        if: ${{ inputs.run_seed_loop || inputs.try_input }}
+      - name: Prepare config and starting seeds
         run: |
           cd game
-          printf '# empty config: first boot test for an AxROM game\n' > game.toml
-          # Yoshi's code-seed addresses are wrong for this ROM: keep the file, empty it.
-          : > cyc_seeds.txt
+          printf '# empty config: AxROM game, seeds come from exploration\n' > game.toml
           rm -rf generated
+          if [ -f "$GITHUB_WORKSPACE/seeds/cyc_seeds.txt" ]; then
+            cp "$GITHUB_WORKSPACE/seeds/cyc_seeds.txt" cyc_seeds.txt
+            echo "starting from $(wc -l < cyc_seeds.txt) saved seeds"
+          else
+            # Yoshi's seed addresses are wrong for this ROM: keep the file, empty.
+            : > cyc_seeds.txt
+            echo "no saved seeds yet: starting empty"
+          fi
 
       - name: Build the game runner
-        if: ${{ inputs.run_seed_loop || inputs.try_input }}
         run: |
           cd game
           # The framework bundles Windows SDL2 headers (they need windows.h),
@@ -106,111 +123,108 @@ jobs:
           set -e
           echo "build exit status: $STATUS"
           grep -n -i -E 'error|fatal|undefined reference|no such file' build_full.log | head -n 40 || true
-          tail -n 20 build_full.log
+          tail -n 10 build_full.log
           exit $STATUS
 
-      - name: Scripted route run (headless)
-        if: ${{ inputs.try_input }}
-        continue-on-error: true
+      - name: Explore with random input (accumulate the miss log)
+        run: |
+          cd game/build
+          export SDL_AUDIODRIVER=dummy
+          cat > gen_route.py <<'PY'
+          import random, sys
+          seed, out, frames = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+          rng = random.Random(seed)
+          # Controls: UP/DOWN/LEFT/RIGHT steer; A or B is gas (we do not know
+          # which), so most steps hold a gas button together with a direction.
+          choices = [("A+LEFT", 10), ("A+RIGHT", 10), ("A", 8),
+                     ("B+LEFT", 10), ("B+RIGHT", 10), ("B", 8),
+                     ("A+B", 4), ("A+B+LEFT", 3), ("A+B+RIGHT", 3),
+                     ("A+UP", 2), ("A+DOWN", 2), ("B+UP", 2), ("B+DOWN", 2),
+                     ("LEFT", 3), ("RIGHT", 3), ("UP", 2), ("DOWN", 2),
+                     ("START", 2), ("SELECT", 1), ("-", 5)]
+          names = [c for c, w in choices for _ in range(w)]
+          lines = []
+          t = 100
+          while t < 900:                       # menu phase: tap START / A
+              lines.append(f"{t} {rng.choice(['START', 'A'])}")
+              lines.append(f"{t + 6} -")
+              t += rng.randint(40, 90)
+          while t < frames - 60:               # play phase: random mashing
+              lines.append(f"{t} {rng.choice(names)}")
+              t += rng.randint(5, 45)
+          with open(out, "w") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+          rm -f miss_all.log
+          for s in 101 102 103 104 105 106 107 108 109 110; do
+            python3 gen_route.py "$s" "route_$s.txt" 6000
+            timeout 300 ./YoshiRecomp "$ROM_PATH" --headless --frames 6000 \
+              --input "route_$s.txt" --miss-log miss_all.log > "run_$s.log" 2>&1 \
+              || echo "route $s exited with status $?"
+            echo "after route $s: $(grep -c -v '^#' miss_all.log 2>/dev/null) distinct addresses so far | $(grep -m1 '^mode=' "run_$s.log")"
+          done
+
+      - name: Merge the seeds and rebuild
         run: |
           cd game
-
-          echo "==== button-name parser (searched across the runner source) ===="
-          grep -rn 'parse_buttons' nesrecomp/runner --include='*.c' --include='*.h' | head -n 10 || true
-          grep -rn -A45 -E '(uint8_t|unsigned( char)?|int) +parse_buttons *\(' \
-            nesrecomp/runner --include='*.c' --include='*.h' | head -n 90 || true
-
-          cd build
-          export SDL_AUDIODRIVER=dummy
-          mkdir -p shots
-
-          # Route: tap START / A alternately through the menus (11 taps, one per
-          # 60 frames from frame 120), then drive: hold A, nudge LEFT then RIGHT,
-          # until about frame 5300. A button stays held until the next step, and
-          # a step with only "-" releases everything. Names that the game does not
-          # recognize are ignored by the parser, which just releases the buttons.
-          : > route1.txt
-          t=120
-          for i in $(seq 1 11); do
-            if [ $((i % 2)) -eq 1 ]; then b=START; else b=A; fi
-            echo "$t $b" >> route1.txt
-            echo "$((t + 6)) -" >> route1.txt
-            t=$((t + 60))
-          done
-          while [ "$t" -lt 5300 ]; do
-            echo "$t A" >> route1.txt;     t=$((t + 90))
-            echo "$t LEFT" >> route1.txt;  t=$((t + 15))
-            echo "$t A" >> route1.txt;     t=$((t + 90))
-            echo "$t RIGHT" >> route1.txt; t=$((t + 15))
-          done
-          echo "$t -" >> route1.txt
-          echo "---- first 12 lines of the route ----"
-          head -n 12 route1.txt
-
-          echo "==== run: 5400 frames with the route ===="
-          timeout 240 ./YoshiRecomp "$ROM_PATH" --headless --frames 5400 \
-            --input route1.txt --miss-log miss_route1.log \
-            --hash-out hash_route1.txt \
-            --screenshot shots/route.png --shot-every 450 > run_route1.log 2>&1 \
-            || echo "route run exited with status $?"
-          tail -n 6 run_route1.log
-          N=$(grep -c -v '^#' miss_route1.log 2>/dev/null || true)
-          echo "RESULT route1: distinct interpreted addresses: ${N:-0} (no input, 3600 frames: 1,720; trial with START/A taps, 1600 frames: 8,055)"
-          ls shots | head -n 20
-
-      - name: Upload route screenshots (private artifact, kept 1 day)
-        if: ${{ inputs.try_input && inputs.save_screenshots }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: route-screenshots
-          path: game/build/shots/*.png
-          retention-days: 1
-          if-no-files-found: warn
-
-      - name: Seed loop (baseline, seed file, rebuild, rerun, compare)
-        if: ${{ inputs.run_seed_loop }}
-        continue-on-error: true
-        run: |
-          cd game
-          EXE=$(realpath build/YoshiRecomp)
-          export SDL_AUDIODRIVER=dummy
-
-          echo "==== 1) baseline run ===="
-          (cd build && timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
-            --hash-out frames_base.hash --miss-log miss.log > run1.log 2>&1) \
-            || echo "baseline exited with status $?"
-          tail -n 3 build/run1.log
-
-          echo "==== 2) turn the miss log into cyc_seeds.txt ===="
-          grep -v '^#' build/miss.log | awk '{print $1}' > cyc_seeds.txt
-          wc -l cyc_seeds.txt
-
-          echo "==== 3) rebuild with the seeds ===="
+          grep -v '^#' build/miss_all.log | awk '{print $1}' > new_seeds.txt
+          cat cyc_seeds.txt new_seeds.txt | grep -v '^#' | sort -u > merged.txt
+          mv merged.txt cyc_seeds.txt
+          echo "SEEDS: $(wc -l < cyc_seeds.txt) addresses in cyc_seeds.txt"
           set +e
           cmake --build build > build_seeded.log 2>&1
           S=$?
           set -e
           echo "rebuild exit status: $S"
           grep -n -i -E 'error|fatal' build_seeded.log | head -n 20 || true
+          find build/cycle-YoshiRecomp -name codegen.log -exec grep -h 'instructions compiled' {} \; || true
+          exit $S
 
-          echo "==== 4) rerun with the seeded build ===="
-          (cd build && timeout 150 "$EXE" "$ROM_PATH" --headless --frames 3600 \
-            --hash-out frames_seeded.hash --miss-log miss2.log > run2.log 2>&1) \
-            || echo "seeded run exited with status $?"
-          tail -n 3 build/run2.log
+      - name: Verify on unseen random scripts (native vs interpreter-only)
+        run: |
+          cd game/build
+          export SDL_AUDIODRIVER=dummy
+          mkdir -p shots
+          for s in 901 902 903; do
+            python3 gen_route.py "$s" "route_$s.txt" 6000
+            timeout 300 ./YoshiRecomp "$ROM_PATH" --headless --frames 6000 \
+              --input "route_$s.txt" --hash-out "hash_native_$s.txt" \
+              --screenshot "shots/seed$s.png" --shot-every 1000 \
+              > "run_native_$s.log" 2>&1 || echo "native $s exited with status $?"
+            timeout 600 ./YoshiRecomp "$ROM_PATH" --headless --interp-only --frames 6000 \
+              --input "route_$s.txt" --hash-out "hash_interp_$s.txt" \
+              > "run_interp_$s.log" 2>&1 || echo "interp $s exited with status $?"
+            if cmp -s "hash_native_$s.txt" "hash_interp_$s.txt"; then
+              r=IDENTICAL
+            else
+              r=DIFFERENT
+            fi
+            echo "VERIFY unseen script $s: frame hashes $r | $(grep -m1 '^mode=' "run_native_$s.log")"
+          done
 
-          echo "==== 5) does the seeded build behave identically? ===="
-          if cmp -s build/frames_base.hash build/frames_seeded.hash; then
-            echo "IDENTICAL: all 3600 frame hashes match"
-          else
-            echo "DIFFERENT: first differing lines:"
-            diff build/frames_base.hash build/frames_seeded.hash | head -n 6
-          fi
+      - name: Upload screenshots (private artifact, kept 1 day)
+        if: ${{ inputs.save_screenshots }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-screenshots
+          path: game/build/shots/*.png
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Commit the seed file back to this repo (addresses only)
+        if: ${{ inputs.commit_seeds }}
+        continue-on-error: true
+        run: |
+          mkdir -p seeds
+          cp game/cyc_seeds.txt seeds/cyc_seeds.txt
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add seeds/cyc_seeds.txt
+          git commit -m "Update code seeds ($(wc -l < seeds/cyc_seeds.txt) addresses)" \
+            || { echo "nothing to commit"; exit 0; }
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            "HEAD:${{ github.ref_name }}"
 
       - name: Wipe ROM and generated code
         if: always()
         run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
-
-      # Next: run the seed loop WITH the route (so the seed file covers menus and
-      # racing, not just the title screen), verify identical hashes, then commit
-      # the seed file (addresses only) back to this repo so progress persists.
