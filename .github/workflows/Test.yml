@@ -34,6 +34,13 @@
 #                    (arm64): A = headless core only, B = windowed core with
 #                    SDL2 built for iOS and the launcher UI switched off.
 #                    These are expected to need fixes; the logs say which.
+#                    FIRST RESULT: probe A stopped at configure ("Cross builds
+#                    require RECOMPILER pointing to a runnable host NESRecomp"),
+#                    so the job now builds a macOS host recompiler first and
+#                    passes it as NESRECOMP_RECOMPILER (a GUESS at the variable
+#                    name; the inspect step prints the real one).
+#   CROSS-PLATFORM CHECK PASSED: the three frame-hash files from Linux (GCC)
+#                    and macOS arm64 (AppleClang) have identical SHA-256s.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -440,6 +447,26 @@ jobs:
             echo "NO saved seeds in the repo (seeds/cyc_seeds.txt): building unseeded"
           fi
 
+      - name: Inspect cross-build requirements and build a host recompiler
+        continue-on-error: true
+        run: |
+          cd game
+          # The first probe failed with "Cross builds require RECOMPILER pointing
+          # to a runnable host NESRecomp". Show how the framework expects that,
+          # then build the recompiler for the macOS host (it runs on the runner).
+          echo "---- RECOMPILER in the cmake files ----"
+          grep -n 'RECOMPILER' nesrecomp/runner/cyc/project.cmake CMakeLists.txt | head -n 30 || true
+          echo "---- project.cmake lines 40-80 ----"
+          sed -n '40,80p' nesrecomp/runner/cyc/project.cmake
+          echo "---- CMakeLists.txt (first 40 lines) ----"
+          head -n 40 CMakeLists.txt
+          echo "==== host recompiler (native macOS build) ===="
+          cmake -S nesrecomp/recompiler -B host-recomp -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            > host_cfg.log 2>&1 || { tail -n 15 host_cfg.log; exit 1; }
+          cmake --build host-recomp > host_build.log 2>&1 || { tail -n 15 host_build.log; exit 1; }
+          ls -la host-recomp | grep -i nesrecomp || true
+          echo "HOST_RECOMPILER=$PWD/host-recomp/NESRecomp" >> "$GITHUB_ENV"
+
       - name: Probe A - headless core cross-compiled for the iOS Simulator
         continue-on-error: true
         run: |
@@ -450,6 +477,7 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DNESRECOMP_HEADLESS=ON -DNESRECOMP_ROM="$ROM_PATH" \
+            -DNESRECOMP_RECOMPILER="$HOST_RECOMPILER" \
             -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" > cfg_a.log 2>&1
           C=$?
           echo "A configure exit status: $C"
@@ -492,6 +520,7 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DNESRECOMP_RECOMP_UI=OFF -DNESRECOMP_ROM="$ROM_PATH" \
+            -DNESRECOMP_RECOMPILER="$HOST_RECOMPILER" \
             -DSDL2_DIR="$GITHUB_WORKSPACE/sdl-install/lib/cmake/SDL2" \
             -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" > cfg_b.log 2>&1
           C=$?
