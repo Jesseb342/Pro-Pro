@@ -27,6 +27,13 @@
 #                    seeds and run the same 3 unseen scripts. The printed
 #                    "HASHSUM" lines should match the Linux ones exactly.
 #                    macOS minutes cost a multiple of Linux minutes: check your plan.
+#                    RESULT SO FAR: it builds (after downgrading one AppleClang
+#                    error) and total cycle counts equal Linux's on all 3
+#                    scripts; native vs interp-only is IDENTICAL on macOS.
+#   ios_probe        macOS: two cross-compile probes for the iOS Simulator
+#                    (arm64): A = headless core only, B = windowed core with
+#                    SDL2 built for iOS and the launcher UI switched off.
+#                    These are expected to need fixes; the logs say which.
 #
 # Template repos use the PolyForm Noncommercial license: keep this noncommercial.
 # ROM_URL and ROM_SHA1 are hardcoded. Keep this repo private.
@@ -59,7 +66,11 @@ on:
       macos_verify:
         description: "macOS: build from the saved seeds and verify the same unseen scripts"
         type: boolean
-        default: true
+        default: false
+      ios_probe:
+        description: "macOS: try cross-compiling the core for the iOS Simulator (two probes)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -379,3 +390,123 @@ jobs:
       - name: Wipe ROM and generated code
         if: always()
         run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build
+
+  ios-probe:
+    if: ${{ inputs.ios_probe }}
+    runs-on: macos-14   # Apple Silicon (arm64)
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Clone template game project and framework
+        run: |
+          git clone --depth 1 https://github.com/mstan/YoshiNESRecomp.git game
+          cd game
+          chmod +x setup.sh
+          ./setup.sh
+          git -C nesrecomp log -1 --format='framework commit: %H (%cd)' || true
+
+      - name: Fetch ROM from Google Drive (kept on the runner only)
+        env:
+          ROM_URL: "https://drive.google.com/uc?export=download&id=13qlBFeeqRVl-sMBtlnH5PRf9poEicja5"
+          ROM_SHA1: "d536d1a6d87fa2c9d32f58f76c9545cc506fea8f"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rom"
+          F="$RUNNER_TEMP/rom/game.nes"
+          curl -fsSL --retry 3 -o "$F" "$ROM_URL"
+          head -c 4 "$F" | grep -q '^NES' \
+            || { echo "Download is not an iNES file (bad link or Drive error)"; exit 1; }
+          echo "$ROM_SHA1  $F" | shasum -a 1 -c -
+          echo "ROM_PATH=$F" >> "$GITHUB_ENV"
+
+      - name: Prepare config and the saved seeds
+        run: |
+          cd game
+          printf '# empty config: AxROM game, seeds come from exploration\n' > game.toml
+          rm -rf generated
+          if [ -f "$GITHUB_WORKSPACE/seeds/cyc_seeds.txt" ]; then
+            cp "$GITHUB_WORKSPACE/seeds/cyc_seeds.txt" cyc_seeds.txt
+            echo "using $(wc -l < cyc_seeds.txt | tr -d ' ') saved seeds"
+          else
+            : > cyc_seeds.txt
+            echo "NO saved seeds in the repo (seeds/cyc_seeds.txt): building unseeded"
+          fi
+
+      - name: Probe A - headless core cross-compiled for the iOS Simulator
+        continue-on-error: true
+        run: |
+          cd game
+          set +e
+          cmake -S . -B build-ios-a -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DNESRECOMP_HEADLESS=ON -DNESRECOMP_ROM="$ROM_PATH" \
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" > cfg_a.log 2>&1
+          C=$?
+          echo "A configure exit status: $C"
+          tail -n 15 cfg_a.log
+          if [ "$C" -ne 0 ]; then exit "$C"; fi
+          cmake --build build-ios-a > build_a.log 2>&1
+          B=$?
+          echo "A build exit status: $B"
+          grep -n -i -E 'error|fatal|undefined' build_a.log | head -n 30
+          tail -n 8 build_a.log
+          echo "---- executables produced ----"
+          find build-ios-a -maxdepth 2 -type f -perm -u+x ! -path '*CMakeFiles*' | head
+          exit "$B"
+
+      - name: Build SDL2 for the iOS Simulator (static)
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --branch release-2.30.0 https://github.com/libsdl-org/SDL.git sdl-src
+          cmake -S sdl-src -B sdl-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/sdl-install"
+          cmake --build sdl-build
+          cmake --install sdl-build
+          ls sdl-install/lib | head
+          ls sdl-install/lib/cmake/SDL2 | head
+
+      - name: Probe B - windowed core (SDL2, no launcher UI) for the iOS Simulator
+        continue-on-error: true
+        run: |
+          cd game
+          # The template calls the launcher's CMake helper unconditionally;
+          # drop that line since the desktop launcher UI is switched off.
+          sed -i '' '/recomp_target_launcher_ui/d' CMakeLists.txt
+          set +e
+          cmake -S . -B build-ios-b -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DNESRECOMP_RECOMP_UI=OFF -DNESRECOMP_ROM="$ROM_PATH" \
+            -DSDL2_DIR="$GITHUB_WORKSPACE/sdl-install/lib/cmake/SDL2" \
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" > cfg_b.log 2>&1
+          C=$?
+          echo "B configure exit status: $C"
+          tail -n 15 cfg_b.log
+          if [ "$C" -ne 0 ]; then exit "$C"; fi
+          cmake --build build-ios-b > build_b.log 2>&1
+          B=$?
+          echo "B build exit status: $B"
+          grep -n -i -E 'error|fatal|undefined' build_b.log | head -n 30
+          tail -n 8 build_b.log
+          echo "---- executables produced ----"
+          find build-ios-b -maxdepth 2 -type f -perm -u+x ! -path '*CMakeFiles*' | head
+          exit "$B"
+
+      - name: Wipe ROM and generated code
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/rom" game/generated game/build-ios-a game/build-ios-b
